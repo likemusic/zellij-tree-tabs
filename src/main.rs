@@ -363,6 +363,13 @@ struct State {
     pending_pane: Option<u32>,
     /// pane whose frame is highlighted while its row is selected in keyboard mode
     highlighted: Option<u32>,
+    /// own tab has had a terminal pane — guards auto-close against a tab that
+    /// is still being created (plugins first, terminal a moment later)
+    had_terminal: bool,
+    /// own tab looked empty in the last PaneUpdate; closed on the next Timer if
+    /// still so (a manifest mid tab-close can show a neighbour's panes split
+    /// across old and new positions — closing at once hit the wrong tab)
+    close_pending: bool,
 }
 
 enum RenameTarget {
@@ -1168,6 +1175,14 @@ impl ZellijPlugin for State {
                 true
             }
             Event::Timer(_) => {
+                if self.close_pending {
+                    self.close_pending = false;
+                    self.had_terminal = false;
+                    if let Some(my_tab) = self.my_tab {
+                        close_tab_with_index(my_tab);
+                    }
+                    // no early return: this may be the title/spinner timer tick
+                }
                 self.timer_running = false;
                 let mut redraw = false;
                 if self.any_working() {
@@ -1215,6 +1230,22 @@ impl ZellijPlugin for State {
                                 self.sidebar_by_tab.insert(*tab_pos, p.id);
                             }
                         }
+                    }
+                }
+                // Auto-close: Zellij keeps a tab while any pane is left, and the sidebar
+                // is one — so `exit` in the last terminal left a tab with just the
+                // sidebar. Each instance closes only its own tab.
+                if let Some(my_tab) = self.my_tab {
+                    let terminals = manifest
+                        .panes
+                        .get(&my_tab)
+                        .map_or(0, |ps| ps.iter().filter(|p| !p.is_plugin).count());
+                    if terminals > 0 {
+                        self.had_terminal = true;
+                        self.close_pending = false;
+                    } else if self.had_terminal && !self.close_pending {
+                        self.close_pending = true;
+                        set_timeout(0.5);
                     }
                 }
                 if let Some(my_tab) = self.my_tab {
