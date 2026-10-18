@@ -363,6 +363,9 @@ struct State {
     keys_origin: Option<usize>,
     /// tab position -> its tiled terminal panes (id, title, focused) in screen order
     tab_panes: BTreeMap<usize, Vec<(u32, String, bool)>>,
+    /// per-pane state from the same pipes as the tab markers (local change), kept
+    /// in memory: every instance gets every pipe, so each holds the full map
+    pane_attention: BTreeMap<u32, Attention>,
     /// interval of the scheduled Timer and time since the last title refresh
     timer_interval: f64,
     title_elapsed: f64,
@@ -412,7 +415,7 @@ enum Row {
     Tab { position: usize, label: String, active: bool, attention: Option<Attention> },
     /// a terminal pane of the tab above, listed when the tab has 2+ panes;
     /// keyboard mode browses onto it (frame highlighted), Enter/click focuses it
-    Pane { id: u32, title: String, focused: bool, last: bool },
+    Pane { id: u32, title: String, focused: bool, last: bool, attention: Option<Attention> },
 }
 
 impl State {
@@ -529,6 +532,7 @@ impl State {
                                 title: title.clone(),
                                 focused: *focused,
                                 last: i + 1 == panes.len(),
+                                attention: self.pane_attention.get(id).copied(),
                             });
                         }
                     }
@@ -686,6 +690,45 @@ impl State {
                 rename_tab_with_id(t.tab_id as u64, format!("{}{}", MARK_WORKING, base));
             }
         }
+    }
+
+    /// Same signal, per pane (local change). Rules mirror the tab markers: the
+    /// pane you're looking at gets no waiting/completed mark; true if it changed.
+    fn set_pane_attention(&mut self, pane_id: u32, signal: &str) -> bool {
+        let seen = matches!(get_focused_pane_info(), Ok((_, PaneId::Terminal(id))) if id == pane_id);
+        let old = self.pane_attention.get(&pane_id).copied();
+        let new = match signal {
+            "working" => Some(Attention::Working),
+            "waiting" if !seen => Some(Attention::Waiting),
+            "completed" if !seen => Some(Attention::Completed),
+            "waiting" | "completed" => None,
+            "clear-working" if old == Some(Attention::Working) => None,
+            _ => return false,
+        };
+        match new {
+            Some(a) => self.pane_attention.insert(pane_id, a),
+            None => self.pane_attention.remove(&pane_id),
+        };
+        new != old
+    }
+
+    /// Focus on a pane means it's seen: drop its waiting/completed mark, and
+    /// forget panes that are gone. True if anything changed.
+    fn clear_seen_panes(&mut self) -> bool {
+        let focused = match get_focused_pane_info() {
+            Ok((_, PaneId::Terminal(id))) => Some(id),
+            _ => None,
+        };
+        let before = self.pane_attention.len();
+        let seen_mark = focused.and_then(|id| self.pane_attention.get(&id).copied());
+        let pane_tab = &self.pane_tab;
+        self.pane_attention.retain(|id, _| pane_tab.contains_key(id));
+        if let (Some(id), Some(a)) = (focused, seen_mark) {
+            if a != Attention::Working {
+                self.pane_attention.remove(&id);
+            }
+        }
+        self.pane_attention.len() != before
     }
 
     /// Strip a working marker (Claude exited without a Stop) — attention marks stay.
@@ -1315,6 +1358,7 @@ impl ZellijPlugin for State {
                         }
                     }
                 }
+                let marks_changed = self.clear_seen_panes();
                 // Outside keyboard mode the bar follows pane focus (Alt+arrows, clicks,
                 // Enter on a pane row) — TabUpdate does not fire for a pane-only change.
                 if !self.keys_on && self.pending_pane.is_none() {
@@ -1337,7 +1381,7 @@ impl ZellijPlugin for State {
                         return true;
                     }
                 }
-                false
+                marks_changed
             }
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -1381,14 +1425,15 @@ impl ZellijPlugin for State {
             if parts.len() == 2 {
                 if let Ok(pane_id) = parts[1].parse::<u32>() {
                     let payload = pipe_message.payload.as_deref().unwrap_or("");
+                    let pane_changed = self.set_pane_attention(pane_id, parts[0]);
                     match parts[0] {
                         "waiting" => {
                             self.set_attention(pane_id, Attention::Waiting);
-                            return false;
+                            return pane_changed;
                         }
                         "completed" => {
                             self.set_attention(pane_id, Attention::Completed);
-                            return false;
+                            return pane_changed;
                         }
                         "cwd" => {
                             self.auto_rename(pane_id, payload, false);
@@ -1400,11 +1445,11 @@ impl ZellijPlugin for State {
                         }
                         "working" => {
                             self.set_working(pane_id);
-                            return false;
+                            return pane_changed;
                         }
                         "clear-working" => {
                             self.clear_working(pane_id);
-                            return false;
+                            return pane_changed;
                         }
                         _ => {}
                     }
@@ -1453,12 +1498,13 @@ impl ZellijPlugin for State {
                         format!("  {} {}{}", dot, self.icon(*attention), label)
                     }
                 }
-                Row::Pane { title, focused, last, .. } => {
+                Row::Pane { title, focused, last, attention, .. } => {
                     let branch = if *last { "└" } else { "├" };
+                    let icon = self.icon(*attention);
                     if *focused {
-                        format!("    {} {}", branch, title)
+                        format!("    {} {}{}", branch, icon, title)
                     } else {
-                        format!("    \u{1b}[2m{} {}\u{1b}[22m", branch, title)
+                        format!("    \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", branch, icon, title)
                     }
                 }
             };
