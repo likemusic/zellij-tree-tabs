@@ -1007,6 +1007,9 @@ impl ZellijPlugin for State {
                     }
                 }
                 if self.keys_on {
+                    let me_focused = me_focused
+                        && matches!(get_focused_pane_info(),
+                            Ok((tab, PaneId::Plugin(id))) if Some(tab) == self.my_tab && id == self.my_id);
                     if me_focused {
                         self.keys_focus_seen = true;
                     } else if self.keys_focus_seen {
@@ -1026,9 +1029,16 @@ impl ZellijPlugin for State {
     /// Attention signals: `zellij-vtabs::waiting|completed::<pane_id>` (broadcast CLI pipe).
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
         if pipe_message.name == "vtabs-focus" {
-            // every instance (one per tab) gets the message; only the visible one acts
-            let active = self.tabs.iter().find(|t| t.active).map(|t| t.position);
-            if active.is_some() && active == self.my_tab && !self.keys_on {
+            // Every instance (one per tab) gets the message; only the one in the
+            // client's focused tab acts. Not self.tabs: hidden instances miss
+            // TabUpdates, so each believes its own tab is still the active one.
+            let Ok((focused_tab, focused_pane)) = get_focused_pane_info() else {
+                return false;
+            };
+            if Some(focused_tab) == self.my_tab && !self.keys_on {
+                if let PaneId::Terminal(id) = focused_pane {
+                    self.prev_focus = Some(id);
+                }
                 self.keys_on = true;
                 self.keys_focus_seen = false;
                 set_selectable(true);
