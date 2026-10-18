@@ -1144,8 +1144,18 @@ impl ZellijPlugin for State {
                 if let Some(pos) = self.tabs.iter().find(|t| t.active).map(|t| t.position) {
                     self.clear_tab(pos);
                 }
+                // Keyboard mode: keep a selection already inside this tab — TabUpdates
+                // also fire on pane highlight/focus changes, and resetting to the tab
+                // row there made browsing bounce back to the first panes.
+                let keep = self.keys_on
+                    && match self.build_rows().get(self.selected) {
+                        Some(Row::Tab { position, .. }) => Some(*position) == self.my_tab,
+                        Some(Row::Pane { id, .. }) => self.pane_tab.get(id) == self.my_tab.as_ref(),
+                        _ => false,
+                    };
                 if self.pending_pane.is_some() {
                     self.select_pending_pane();
+                } else if keep {
                 } else if let Some(i) = self.active_row_index() {
                     self.selected = i;
                 } else {
