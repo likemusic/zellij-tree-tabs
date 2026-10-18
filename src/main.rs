@@ -1476,7 +1476,13 @@ fn tab_name_from_pane(title: &str) -> String {
     let t = title.trim_start_matches(|c: char| {
         !(c.is_alphanumeric() || c == '~' || c == '/' || c == '.' || c == '…' || c == '_' || c == '-')
     });
-    t.strip_prefix("…/").unwrap_or(t).trim().to_string()
+    let t = t.strip_prefix("…/").unwrap_or(t).trim();
+    // a command line (held pane before a restore, `Waiting to run: …`): its program
+    // name — `/home/u/.local/bin/claude-zellij --zellij-marker …` -> `claude-zellij`
+    match t.split_once(char::is_whitespace) {
+        Some((cmd, _)) if cmd.starts_with('/') => cmd.rsplit('/').next().unwrap_or(cmd).to_string(),
+        _ => t.to_string(),
+    }
 }
 
 /// Number of *visible* characters, ignoring ANSI CSI escape sequences (`ESC [ … letter`).
