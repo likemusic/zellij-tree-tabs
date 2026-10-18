@@ -15,6 +15,8 @@
 #   Stop             -> vtabs-work.sh stop
 #   Notification     -> vtabs-work.sh notify
 #   SessionEnd       -> vtabs-work.sh end
+#   PostToolUse      -> vtabs-work.sh tool   (relights the spinner once after a Notification
+#                       pause, e.g. an answered permission prompt)
 #
 # Set VTABS_WORK_DRYRUN=1 to print the computed signal instead of piping it
 # (used by the tests).
@@ -31,23 +33,24 @@ state="$dir/pane-$ZELLIJ_PANE_ID"
 signal=$(
   exec 9>"$state.lock"
   flock 9
-  main=0; subs=0
-  [ -f "$state" ] && read -r main subs < "$state" 2>/dev/null
-  case "$main$subs" in *[!0-9]*|"") main=0; subs=0 ;; esac
-  : "${main:=0}" "${subs:=0}"
+  main=0; subs=0; paused=0
+  [ -f "$state" ] && read -r main subs paused < "$state" 2>/dev/null
+  : "${main:=0}" "${subs:=0}" "${paused:=0}"
+  case "$main$subs$paused" in *[!0-9]*) main=0; subs=0; paused=0 ;; esac
   case "$event" in
-    prompt)          main=1; subs=0 ;;                       # new user turn: start fresh
+    prompt)          main=1; subs=0; paused=0 ;;             # new user turn: start fresh
     subagent-start)  subs=$((subs + 1)) ;;
     subagent-stop)   subs=$((subs - 1)); [ "$subs" -lt 0 ] && subs=0 ;;
-    stop)            main=0 ;;
-    notify)          : ;;                                    # needs input; counts unchanged
+    stop)            main=0; paused=0 ;;
+    notify)          paused=1 ;;                             # needs input; counts unchanged
+    tool)            [ "$paused" = 1 ] || exit 0; paused=0 ;; # work resumed after the pause
     end)             main=0; subs=0 ;;
     *)               exit 0 ;;
   esac
   if [ "$event" = end ]; then
     rm -f "$state"
   else
-    printf '%s %s\n' "$main" "$subs" > "$state"
+    printf '%s %s %s\n' "$main" "$subs" "$paused" > "$state"
   fi
   # Only `stop` (main-turn end) with no outstanding subagents shows the check.
   # subagent-stop never completes — the main agent is re-invoked to process the

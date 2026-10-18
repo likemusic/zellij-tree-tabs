@@ -1,10 +1,10 @@
-# zellij-vtabs
+# zellij-tree-tabs
 
 A vertical, grouped, collapsible tab sidebar for [Zellij](https://zellij.dev) — with attention indicators driven by Claude Code.
 
 ## This fork
 
-A fork of [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs), used daily with many Claude Code sessions in one Zellij session (Zellij 0.45, Windows Terminal + WSL). Everything below this section is the upstream README; the changes on the `local` branch are:
+`zellij-tree-tabs` is a fork of [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs), used daily with many Claude Code sessions in one Zellij session (Zellij 0.45, Windows Terminal + WSL). Everything below this section is the upstream README; the changes on the `local` branch are:
 
 - **Pane list under each tab** with two or more panes, titles refreshed every 2 s (Claude's own session titles show up there); `show_single_pane "true"` lists a lone pane too.
 - **Per-pane state icons**: the same `waiting` / `working` / `completed` pipes mark the pane row, not only the tab. The pane you are looking at gets no waiting/completed mark; focusing a pane clears it.
@@ -15,7 +15,7 @@ A fork of [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs), used dail
 - **Auto-named one-pane tabs** follow their pane title (for a command line just the program name) until renamed by hand.
 - **Auto-close**: a tab where only the sidebar is left (the terminal exited) closes itself.
 
-The companion hook script (Claude Code `UserPromptSubmit` / `Stop` / `Notification` / `PostToolUse` / subagent events → `zellij pipe --name zellij-vtabs::<signal>::<pane>`) and the full setup are described in [likemusic/terminal-setup](https://github.com/likemusic/terminal-setup).
+The plugin file, pipe names and config keys keep the upstream name `zellij-vtabs` (`zellij-vtabs.wasm`, `zellij-vtabs::<signal>::<pane>`), so existing configs keep working. Setup is the same as upstream below; [Claude Code integration](#claude-code-integration) lists the hooks, including the fork's `PostToolUse` and compact hooks.
 
 > ⚠️ **This is a personal tool, built for my own setup — not a general-purpose plugin.**
 > It hardcodes assumptions about *my* workflow: my plugin path, my `:`-based tab-naming
@@ -175,7 +175,13 @@ cp shell/vtabs-work.sh ~/.config/zellij/vtabs-work.sh && chmod +x ~/.config/zell
     "Stop": [{ "hooks": [{ "type": "command", "timeout": 3,
       "command": "(~/.config/zellij/vtabs-work.sh stop >/dev/null 2>&1 &)" }] }],
     "SessionEnd": [{ "hooks": [{ "type": "command", "timeout": 3,
-      "command": "(~/.config/zellij/vtabs-work.sh end >/dev/null 2>&1 &)" }] }]
+      "command": "(~/.config/zellij/vtabs-work.sh end >/dev/null 2>&1 &)" }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "timeout": 3,
+      "command": "(~/.config/zellij/vtabs-work.sh tool >/dev/null 2>&1 &)" }] }],
+    "PreCompact": [{ "matcher": "manual", "hooks": [{ "type": "command", "timeout": 3,
+      "command": "(~/.config/zellij/vtabs-work.sh prompt >/dev/null 2>&1 &)" }] }],
+    "PostCompact": [{ "matcher": "manual", "hooks": [{ "type": "command", "timeout": 3,
+      "command": "(~/.config/zellij/vtabs-work.sh stop >/dev/null 2>&1 &)" }] }]
   }
 }
 ```
@@ -188,6 +194,8 @@ cp shell/vtabs-work.sh ~/.config/zellij/vtabs-work.sh && chmod +x ~/.config/zell
   fires once per *main-agent* turn, so without it the spinner would clear while background
   subagents are still working
 - `SessionEnd` (Claude exits) → clears any leftover spinner and the pane's count
+- `PostToolUse` → after a `Notification` pause (e.g. an answered permission prompt) the next tool call relights the spinner once; otherwise it sends nothing, so it is cheap on every tool call
+- `PreCompact` / `PostCompact` (manual `/compact`) → spinner while compacting, `✓` when done
 - Focusing the tab clears `◆`/`✓`; the spinner survives focus and ends via the hooks above
 
 The script also plays a freedesktop sound on exactly those two real events — `complete`
