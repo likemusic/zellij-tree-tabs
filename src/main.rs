@@ -332,6 +332,10 @@ struct State {
     spinner: Vec<String>,
     spin: usize,
     timer_running: bool,
+    /// `pinned` config key (default true): once permissions are granted the pane
+    /// turns non-selectable like tab-bar/status-bar — MovePane and focus moves skip
+    /// it, mouse clicks still work. "false" keeps the pane focusable for keys.
+    pinned: bool,
 }
 
 enum RenameTarget {
@@ -872,6 +876,7 @@ impl ZellijPlugin for State {
         };
         self.autogroup_rules = parse_autogroup_rules(&configuration);
         self.spinner = parse_spinner(configuration.get("spinner"));
+        self.pinned = configuration.get("pinned").map(String::as_str) != Some("false");
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -884,11 +889,20 @@ impl ZellijPlugin for State {
             EventType::Key,
             EventType::Mouse,
             EventType::Timer,
+            EventType::PermissionRequestResult,
         ]);
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
+            // Not in load(): a non-selectable pane can't take the `y` answer to the
+            // permission prompt, so pin only after the grant (cached grants fire it too).
+            Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                if self.pinned {
+                    set_selectable(false);
+                }
+                false
+            }
             Event::ModeUpdate(mode_info) => {
                 if mode_info.session_name != self.session {
                     self.session = mode_info.session_name;
