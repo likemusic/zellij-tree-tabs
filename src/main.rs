@@ -538,10 +538,17 @@ impl State {
         rows
     }
 
+    /// Row of what has focus: the focused pane's row when the active tab lists
+    /// its panes (local change: the bar used to jump back to the tab row after
+    /// Enter on a pane), else the active tab's row.
     fn active_row_index(&self) -> Option<usize> {
-        self.build_rows()
+        let rows = self.build_rows();
+        let tab = rows.iter().position(|r| matches!(r, Row::Tab { active: true, .. }))?;
+        let pane = rows[tab + 1..]
             .iter()
-            .position(|r| matches!(r, Row::Tab { active: true, .. }))
+            .take_while(|r| matches!(r, Row::Pane { .. }))
+            .position(|r| matches!(r, Row::Pane { focused: true, .. }));
+        Some(pane.map_or(tab, |i| tab + 1 + i))
     }
 
     fn icon(&self, att: Option<Attention>) -> String {
@@ -1305,6 +1312,16 @@ impl ZellijPlugin for State {
                             ps.iter().find(|p| !p.is_plugin && p.is_focused && !p.is_floating)
                         }) {
                             self.prev_focus = Some(p.id);
+                        }
+                    }
+                }
+                // Outside keyboard mode the bar follows pane focus (Alt+arrows, clicks,
+                // Enter on a pane row) — TabUpdate does not fire for a pane-only change.
+                if !self.keys_on && self.pending_pane.is_none() {
+                    if let Some(i) = self.active_row_index() {
+                        if i != self.selected {
+                            self.selected = i;
+                            return true;
                         }
                     }
                 }
