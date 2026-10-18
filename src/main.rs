@@ -1007,9 +1007,9 @@ impl ZellijPlugin for State {
                     }
                 }
                 if self.keys_on {
+                    // plugin ids are unique per instance, so the pane alone identifies us
                     let me_focused = me_focused
-                        && matches!(get_focused_pane_info(),
-                            Ok((tab, PaneId::Plugin(id))) if Some(tab) == self.my_tab && id == self.my_id);
+                        && matches!(get_focused_pane_info(), Ok((_, PaneId::Plugin(id))) if id == self.my_id);
                     if me_focused {
                         self.keys_focus_seen = true;
                     } else if self.keys_focus_seen {
@@ -1029,16 +1029,16 @@ impl ZellijPlugin for State {
     /// Attention signals: `zellij-vtabs::waiting|completed::<pane_id>` (broadcast CLI pipe).
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
         if pipe_message.name == "vtabs-focus" {
-            // Every instance (one per tab) gets the message; only the one in the
-            // client's focused tab acts. Not self.tabs: hidden instances miss
-            // TabUpdates, so each believes its own tab is still the active one.
-            let Ok((focused_tab, focused_pane)) = get_focused_pane_info() else {
+            // Every instance (one per tab) gets the message; only the one whose tab
+            // holds the client's focused pane acts. Not self.tabs: hidden instances
+            // miss TabUpdates, so each believes its own tab is still the active one.
+            // Not the returned tab index either: it is the tab *id*, which drifts
+            // from the position once a tab is closed. pane_tab is fresh (PaneUpdate).
+            let Ok((_, PaneId::Terminal(focused))) = get_focused_pane_info() else {
                 return false;
             };
-            if Some(focused_tab) == self.my_tab && !self.keys_on {
-                if let PaneId::Terminal(id) = focused_pane {
-                    self.prev_focus = Some(id);
-                }
+            if self.pane_tab.get(&focused) == self.my_tab.as_ref() && !self.keys_on {
+                self.prev_focus = Some(focused);
                 self.keys_on = true;
                 self.keys_focus_seen = false;
                 set_selectable(true);
