@@ -2,6 +2,21 @@
 
 A vertical, grouped, collapsible tab sidebar for [Zellij](https://zellij.dev) — with attention indicators driven by Claude Code.
 
+## This fork
+
+A fork of [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs), used daily with many Claude Code sessions in one Zellij session (Zellij 0.45, Windows Terminal + WSL). Everything below this section is the upstream README; the changes on the `local` branch are:
+
+- **Pane list under each tab** with two or more panes, titles refreshed every 2 s (Claude's own session titles show up there); `show_single_pane "true"` lists a lone pane too.
+- **Per-pane state icons**: the same `waiting` / `working` / `completed` pipes mark the pane row, not only the tab. The pane you are looking at gets no waiting/completed mark; focusing a pane clears it.
+- **State markers as prefixes** (`⚙ name` instead of `name ⚙`); old suffix markers are still recognized.
+- **Keyboard mode** (`MessagePlugin … { name "vtabs-focus"; }`, e.g. bound to `Alt+w`): arrows / `j` `k` browse tabs with a live preview and step onto pane rows (the pane frame is highlighted), Enter stays/focuses, Esc returns. Needs the `MessageAndLaunchOtherPlugins` permission for the hand-over between per-tab instances.
+- **Selection follows focus**: the highlighted row is the focused pane's row when the active tab lists its panes, also after Alt+arrows and clicks.
+- **Pinned sidebar** (`pinned`, on by default): focus never lands on the sidebar by accident; `pinned "false"` restores upstream behavior.
+- **Auto-named one-pane tabs** follow their pane title (for a command line just the program name) until renamed by hand.
+- **Auto-close**: a tab where only the sidebar is left (the terminal exited) closes itself.
+
+The companion hook script (Claude Code `UserPromptSubmit` / `Stop` / `Notification` / `PostToolUse` / subagent events → `zellij pipe --name zellij-vtabs::<signal>::<pane>`) and the full setup are described in [likemusic/terminal-setup](https://github.com/likemusic/terminal-setup).
+
 > ⚠️ **This is a personal tool, built for my own setup — not a general-purpose plugin.**
 > It hardcodes assumptions about *my* workflow: my plugin path, my `:`-based tab-naming
 > convention, my Zellij version, my Claude Code hooks. It is published for my own reuse
