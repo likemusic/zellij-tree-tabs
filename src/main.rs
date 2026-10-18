@@ -358,6 +358,11 @@ struct State {
     /// interval of the scheduled Timer and time since the last title refresh
     timer_interval: f64,
     title_elapsed: f64,
+    /// keyboard mode: pane row handed over with the keys — re-selected after the
+    /// TabUpdate that follows the switch (which would select the tab row)
+    pending_pane: Option<u32>,
+    /// pane whose frame is highlighted while its row is selected in keyboard mode
+    highlighted: Option<u32>,
 }
 
 enum RenameTarget {
@@ -383,7 +388,7 @@ enum Row {
     Group { name: String, collapsed: bool, count: usize, attention: Option<Attention> },
     Tab { position: usize, label: String, active: bool, attention: Option<Attention> },
     /// a terminal pane of the tab above, listed when the tab has 2+ panes;
-    /// display + click only — keyboard navigation skips these rows
+    /// keyboard mode browses onto it (frame highlighted), Enter/click focuses it
     Pane { id: u32, title: String, focused: bool, last: bool },
 }
 
@@ -841,25 +846,35 @@ impl State {
         true
     }
 
-    /// Next selectable row (group or tab) from `from` in direction `down`;
-    /// stays put at the ends.
+    /// Next row from `from` in direction `down`; stays put at the ends.
     fn step(rows: &[Row], from: usize, down: bool) -> usize {
-        let mut i = from;
-        loop {
-            if down {
-                if i + 1 >= rows.len() {
-                    return from;
-                }
-                i += 1;
-            } else {
-                if i == 0 {
-                    return from;
-                }
-                i -= 1;
-            }
-            if !matches!(rows[i], Row::Pane { .. }) {
-                return i;
-            }
+        if down {
+            (from + 1).min(rows.len().saturating_sub(1))
+        } else {
+            from.saturating_sub(1)
+        }
+    }
+
+    /// Frame-highlight `pane` (None: just clear the previous highlight).
+    fn highlight(&mut self, pane: Option<u32>) {
+        if self.highlighted == pane {
+            return;
+        }
+        let off: Vec<PaneId> = self.highlighted.map(PaneId::Terminal).into_iter().collect();
+        let on: Vec<PaneId> = pane.map(PaneId::Terminal).into_iter().collect();
+        highlight_and_unhighlight_panes(on, off);
+        self.highlighted = pane;
+    }
+
+    fn select_pending_pane(&mut self) {
+        let Some(id) = self.pending_pane else { return };
+        if let Some(i) = self
+            .build_rows()
+            .iter()
+            .position(|r| matches!(r, Row::Pane { id: p, .. } if *p == id))
+        {
+            self.selected = i;
+            self.highlight(Some(id));
         }
     }
 
@@ -873,23 +888,55 @@ impl State {
 
     /// Browsing onto another tab shows it right away; keyboard mode moves to
     /// that tab's sidebar instance (only one plugin pane can hold the keys).
-    fn browse_to(&mut self, position: usize) {
+    fn browse_to(&mut self, position: usize, pane: Option<u32>) {
         let Some(&target) = self.sidebar_by_tab.get(&position) else {
             return;
         };
         let origin = self.keys_origin;
         self.keys_off(false);
         switch_tab_to(position as u32 + 1);
-        let mut msg = MessageToPlugin::new("vtabs-take-keys").with_destination_plugin_id(target);
-        if let Some(o) = origin {
-            msg = msg.with_payload(o.to_string());
+        // payload "origin_tab:pane_id", either part may be empty
+        let payload = format!(
+            "{}:{}",
+            origin.map(|o| o.to_string()).unwrap_or_default(),
+            pane.map(|p| p.to_string()).unwrap_or_default()
+        );
+        pipe_message_to_plugin(
+            MessageToPlugin::new("vtabs-take-keys")
+                .with_destination_plugin_id(target)
+                .with_payload(payload),
+        );
+    }
+
+    /// Keyboard mode moved the selection to row `idx`: show its tab, and for a
+    /// pane row highlight that pane's frame.
+    fn browse_row(&mut self, rows: &[Row], idx: usize) {
+        self.pending_pane = None;
+        match rows.get(idx) {
+            Some(Row::Tab { position, .. }) => {
+                if Some(*position) != self.my_tab {
+                    self.browse_to(*position, None);
+                } else {
+                    self.highlight(None);
+                }
+            }
+            Some(Row::Pane { id, .. }) => {
+                let tab = self.pane_tab.get(id).copied();
+                if tab.is_some() && tab != self.my_tab {
+                    self.browse_to(tab.unwrap(), Some(*id));
+                } else {
+                    self.highlight(Some(*id));
+                }
+            }
+            _ => self.highlight(None),
         }
-        pipe_message_to_plugin(msg);
     }
 
     fn keys_off(&mut self, restore_focus: bool) {
         self.keys_on = false;
         self.keys_focus_seen = false;
+        self.pending_pane = None;
+        self.highlight(None);
         if self.pinned {
             set_selectable(false);
         }
@@ -925,6 +972,12 @@ impl State {
                 }
                 // Enter on a tab: it is already shown, just give the keys back to it
                 BareKey::Enter => {
+                    if let Some(Row::Pane { id, .. }) = rows.get(self.selected) {
+                        let id = *id;
+                        self.keys_off(false);
+                        focus_terminal_pane(id, false, false);
+                        return true;
+                    }
                     if let Some(Row::Tab { position, .. }) = rows.get(self.selected) {
                         if Some(*position) == self.my_tab {
                             self.keys_off(true);
@@ -939,11 +992,7 @@ impl State {
                 BareKey::Char('j') | BareKey::Down | BareKey::Char('k') | BareKey::Up if !shift => {
                     let down = matches!(key.bare_key, BareKey::Char('j') | BareKey::Down);
                     self.selected = Self::step(&rows, self.selected, down);
-                    if let Some(Row::Tab { position, .. }) = rows.get(self.selected) {
-                        if Some(*position) != self.my_tab {
-                            self.browse_to(*position);
-                        }
-                    }
+                    self.browse_row(&rows, self.selected);
                     return true;
                 }
                 _ => {}
@@ -1095,7 +1144,9 @@ impl ZellijPlugin for State {
                 if let Some(pos) = self.tabs.iter().find(|t| t.active).map(|t| t.position) {
                     self.clear_tab(pos);
                 }
-                if let Some(i) = self.active_row_index() {
+                if self.pending_pane.is_some() {
+                    self.select_pending_pane();
+                } else if let Some(i) = self.active_row_index() {
                     self.selected = i;
                 } else {
                     let len = self.build_rows().len();
@@ -1206,8 +1257,12 @@ impl ZellijPlugin for State {
         // hand-over from the instance of the previously shown tab (payload: origin tab)
         if pipe_message.name == "vtabs-take-keys" {
             if !self.keys_on {
-                let origin = pipe_message.payload.as_deref().and_then(|p| p.parse().ok());
-                self.keys_on_here(origin);
+                let (origin, pane) = pipe_message.payload.as_deref().unwrap_or("").split_once(':').unwrap_or(("", ""));
+                self.keys_on_here(origin.parse().ok());
+                if let Ok(id) = pane.parse::<u32>() {
+                    self.pending_pane = Some(id);
+                    self.select_pending_pane();
+                }
                 return true;
             }
             return false;
