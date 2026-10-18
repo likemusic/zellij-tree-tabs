@@ -977,6 +977,8 @@ impl ZellijPlugin for State {
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::ReadCliPipes,
+            // keyboard-mode hand-over between the per-tab instances (vtabs-take-keys)
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
         subscribe(&[
             EventType::ModeUpdate,
