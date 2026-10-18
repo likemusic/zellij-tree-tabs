@@ -26,6 +26,9 @@ const MARK_WORKING: &str = " ⚙";
 /// config key (each char = one frame; width-1 glyphs only).
 const SPINNER_DEFAULT: &str = "⣾⣽⣻⢿⡿⣟⣯⣷";
 const SPINNER_INTERVAL: f64 = 0.15;
+/// Pane titles set by programs (OSC, e.g. Claude Code) don't trigger a
+/// PaneUpdate, so the visible sidebar re-reads them this often (seconds).
+const TITLE_INTERVAL: f64 = 2.0;
 
 /// Each char of the `spinner` config value is one animation frame.
 fn parse_spinner(config: Option<&String>) -> Vec<String> {
@@ -352,6 +355,9 @@ struct State {
     keys_origin: Option<usize>,
     /// tab position -> its tiled terminal panes (id, title, focused) in screen order
     tab_panes: BTreeMap<usize, Vec<(u32, String, bool)>>,
+    /// interval of the scheduled Timer and time since the last title refresh
+    timer_interval: f64,
+    title_elapsed: f64,
 }
 
 enum RenameTarget {
@@ -534,10 +540,39 @@ impl State {
 
     /// Arm the animation timer if something is working and none is scheduled.
     fn ensure_timer(&mut self) {
-        if self.any_working() && !self.timer_running {
-            set_timeout(SPINNER_INTERVAL);
+        if !self.timer_running {
+            self.timer_interval = if self.any_working() { SPINNER_INTERVAL } else { TITLE_INTERVAL };
+            set_timeout(self.timer_interval);
             self.timer_running = true;
         }
+    }
+
+    /// Re-read pane titles if this instance is the visible one; true if any changed.
+    fn refresh_titles(&mut self) -> bool {
+        let visible = match get_focused_pane_info() {
+            Ok((_, PaneId::Terminal(id))) => self.pane_tab.get(&id) == self.my_tab.as_ref(),
+            Ok((_, PaneId::Plugin(id))) => id == self.my_id,
+            Err(_) => false,
+        };
+        if !visible {
+            return false;
+        }
+        let mut changed = false;
+        for panes in self.tab_panes.values_mut() {
+            if panes.len() < 2 {
+                continue; // not listed in the sidebar
+            }
+            for (id, title, _) in panes.iter_mut() {
+                if let Some(info) = get_pane_info(PaneId::Terminal(*id)) {
+                    let t = short_title(&info.title);
+                    if *title != t {
+                        *title = t;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// Server-fresh info for the tab containing `pane_id`. Pipe-driven renames
@@ -1027,6 +1062,7 @@ impl ZellijPlugin for State {
             EventType::Timer,
             EventType::PermissionRequestResult,
         ]);
+        self.ensure_timer();
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -1072,13 +1108,18 @@ impl ZellijPlugin for State {
             }
             Event::Timer(_) => {
                 self.timer_running = false;
+                let mut redraw = false;
                 if self.any_working() {
                     self.spin = self.spin.wrapping_add(1);
-                    self.ensure_timer();
-                    true
-                } else {
-                    false
+                    redraw = true;
                 }
+                self.title_elapsed += self.timer_interval;
+                if self.title_elapsed >= TITLE_INTERVAL {
+                    self.title_elapsed = 0.0;
+                    redraw |= self.refresh_titles();
+                }
+                self.ensure_timer();
+                redraw
             }
             Event::PaneUpdate(manifest) => {
                 self.pane_tab.clear();
