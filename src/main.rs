@@ -336,6 +336,15 @@ struct State {
     /// turns non-selectable like tab-bar/status-bar — MovePane and focus moves skip
     /// it, mouse clicks still work. "false" keeps the pane focusable for keys.
     pinned: bool,
+    /// Keyboard mode of a pinned sidebar (`vtabs-focus` pipe, e.g. from a
+    /// MessagePlugin keybind): the pane is made selectable and focused until
+    /// Esc, Enter on a tab, or focus leaving it; then it is pinned again.
+    my_id: u32,
+    my_tab: Option<usize>,
+    /// terminal pane focused in this tab before keyboard mode — focus returns there
+    prev_focus: Option<u32>,
+    keys_on: bool,
+    keys_focus_seen: bool,
 }
 
 enum RenameTarget {
@@ -772,6 +781,19 @@ impl State {
         true
     }
 
+    fn keys_off(&mut self, restore_focus: bool) {
+        self.keys_on = false;
+        self.keys_focus_seen = false;
+        if self.pinned {
+            set_selectable(false);
+        }
+        if restore_focus {
+            if let Some(id) = self.prev_focus {
+                focus_terminal_pane(id, false, false);
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
         if self.renaming.is_some() {
             return self.handle_rename_key(key);
@@ -781,6 +803,23 @@ impl State {
             return false;
         }
         let shift = key.key_modifiers.contains(&KeyModifier::Shift);
+        if self.keys_on {
+            match key.bare_key {
+                BareKey::Esc => {
+                    self.keys_off(true);
+                    return true;
+                }
+                BareKey::Enter => {
+                    let sel = self.selected;
+                    if matches!(self.build_rows().get(sel), Some(Row::Tab { .. })) {
+                        // pin before switching: the old tab keeps no focusable sidebar
+                        self.keys_off(false);
+                    }
+                    return self.activate(sel);
+                }
+                _ => {}
+            }
+        }
         match key.bare_key {
             // shifted chars arrive as their uppercase form, arrows carry the modifier
             BareKey::Char('J') => self.move_selected(1),
@@ -877,6 +916,7 @@ impl ZellijPlugin for State {
         self.autogroup_rules = parse_autogroup_rules(&configuration);
         self.spinner = parse_spinner(configuration.get("spinner"));
         self.pinned = configuration.get("pinned").map(String::as_str) != Some("false");
+        self.my_id = get_plugin_ids().plugin_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -946,11 +986,33 @@ impl ZellijPlugin for State {
             }
             Event::PaneUpdate(manifest) => {
                 self.pane_tab.clear();
+                let mut me_focused = false;
                 for (tab_pos, panes) in &manifest.panes {
                     for p in panes {
                         if !p.is_plugin {
                             self.pane_tab.insert(p.id, *tab_pos);
+                        } else if p.id == self.my_id {
+                            self.my_tab = Some(*tab_pos);
+                            me_focused = p.is_focused;
                         }
+                    }
+                }
+                if let Some(my_tab) = self.my_tab {
+                    if !self.keys_on {
+                        if let Some(p) = manifest.panes.get(&my_tab).and_then(|ps| {
+                            ps.iter().find(|p| !p.is_plugin && p.is_focused && !p.is_floating)
+                        }) {
+                            self.prev_focus = Some(p.id);
+                        }
+                    }
+                }
+                if self.keys_on {
+                    if me_focused {
+                        self.keys_focus_seen = true;
+                    } else if self.keys_focus_seen {
+                        // focus left (click elsewhere, Alt+arrow): pin again, keep focus where it went
+                        self.keys_off(false);
+                        return true;
                     }
                 }
                 false
@@ -963,6 +1025,18 @@ impl ZellijPlugin for State {
 
     /// Attention signals: `zellij-vtabs::waiting|completed::<pane_id>` (broadcast CLI pipe).
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        if pipe_message.name == "vtabs-focus" {
+            // every instance (one per tab) gets the message; only the visible one acts
+            let active = self.tabs.iter().find(|t| t.active).map(|t| t.position);
+            if active.is_some() && active == self.my_tab && !self.keys_on {
+                self.keys_on = true;
+                self.keys_focus_seen = false;
+                set_selectable(true);
+                focus_plugin_pane(self.my_id, false, false);
+                return true;
+            }
+            return false;
+        }
         if let Some(rest) = pipe_message.name.strip_prefix("zellij-vtabs::") {
             let parts: Vec<&str> = rest.split("::").collect();
             if parts.len() == 2 {
