@@ -345,6 +345,11 @@ struct State {
     prev_focus: Option<u32>,
     keys_on: bool,
     keys_focus_seen: bool,
+    /// tab position -> plugin id of the vtabs instance in that tab (from PaneUpdate),
+    /// to hand keyboard mode over when browsing switches the visible tab
+    sidebar_by_tab: BTreeMap<usize, u32>,
+    /// tab where keyboard mode started — Esc goes back there
+    keys_origin: Option<usize>,
 }
 
 enum RenameTarget {
@@ -781,6 +786,30 @@ impl State {
         true
     }
 
+    fn keys_on_here(&mut self, origin: Option<usize>) {
+        self.keys_on = true;
+        self.keys_focus_seen = false;
+        self.keys_origin = origin;
+        set_selectable(true);
+        focus_plugin_pane(self.my_id, false, false);
+    }
+
+    /// Browsing onto another tab shows it right away; keyboard mode moves to
+    /// that tab's sidebar instance (only one plugin pane can hold the keys).
+    fn browse_to(&mut self, position: usize) {
+        let Some(&target) = self.sidebar_by_tab.get(&position) else {
+            return;
+        };
+        let origin = self.keys_origin;
+        self.keys_off(false);
+        switch_tab_to(position as u32 + 1);
+        let mut msg = MessageToPlugin::new("vtabs-take-keys").with_destination_plugin_id(target);
+        if let Some(o) = origin {
+            msg = msg.with_payload(o.to_string());
+        }
+        pipe_message_to_plugin(msg);
+    }
+
     fn keys_off(&mut self, restore_focus: bool) {
         self.keys_on = false;
         self.keys_focus_seen = false;
@@ -804,18 +833,45 @@ impl State {
         }
         let shift = key.key_modifiers.contains(&KeyModifier::Shift);
         if self.keys_on {
+            let rows = self.build_rows();
             match key.bare_key {
+                // Esc: cancel browsing — back to the tab where keyboard mode started
                 BareKey::Esc => {
-                    self.keys_off(true);
+                    match self.keys_origin {
+                        Some(o) if Some(o) != self.my_tab => {
+                            self.keys_off(false);
+                            switch_tab_to(o as u32 + 1);
+                        }
+                        _ => self.keys_off(true),
+                    }
                     return true;
                 }
+                // Enter on a tab: it is already shown, just give the keys back to it
                 BareKey::Enter => {
-                    let sel = self.selected;
-                    if matches!(self.build_rows().get(sel), Some(Row::Tab { .. })) {
-                        // pin before switching: the old tab keeps no focusable sidebar
+                    if let Some(Row::Tab { position, .. }) = rows.get(self.selected) {
+                        if Some(*position) == self.my_tab {
+                            self.keys_off(true);
+                            return true;
+                        }
+                        let p = *position;
                         self.keys_off(false);
+                        switch_tab_to(p as u32 + 1);
+                        return true;
                     }
-                    return self.activate(sel);
+                }
+                BareKey::Char('j') | BareKey::Down | BareKey::Char('k') | BareKey::Up if !shift => {
+                    let down = matches!(key.bare_key, BareKey::Char('j') | BareKey::Down);
+                    self.selected = if down {
+                        (self.selected + 1).min(len - 1)
+                    } else {
+                        self.selected.saturating_sub(1)
+                    };
+                    if let Some(Row::Tab { position, .. }) = rows.get(self.selected) {
+                        if Some(*position) != self.my_tab {
+                            self.browse_to(*position);
+                        }
+                    }
+                    return true;
                 }
                 _ => {}
             }
@@ -987,13 +1043,25 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(manifest) => {
                 self.pane_tab.clear();
                 let mut me_focused = false;
+                let my_url = manifest
+                    .panes
+                    .values()
+                    .flatten()
+                    .find(|p| p.is_plugin && p.id == self.my_id)
+                    .and_then(|p| p.plugin_url.clone());
+                self.sidebar_by_tab.clear();
                 for (tab_pos, panes) in &manifest.panes {
                     for p in panes {
                         if !p.is_plugin {
                             self.pane_tab.insert(p.id, *tab_pos);
-                        } else if p.id == self.my_id {
-                            self.my_tab = Some(*tab_pos);
-                            me_focused = p.is_focused;
+                        } else {
+                            if p.id == self.my_id {
+                                self.my_tab = Some(*tab_pos);
+                                me_focused = p.is_focused;
+                            }
+                            if my_url.is_some() && p.plugin_url == my_url {
+                                self.sidebar_by_tab.insert(*tab_pos, p.id);
+                            }
                         }
                     }
                 }
@@ -1039,10 +1107,16 @@ impl ZellijPlugin for State {
             };
             if self.pane_tab.get(&focused) == self.my_tab.as_ref() && !self.keys_on {
                 self.prev_focus = Some(focused);
-                self.keys_on = true;
-                self.keys_focus_seen = false;
-                set_selectable(true);
-                focus_plugin_pane(self.my_id, false, false);
+                self.keys_on_here(self.my_tab);
+                return true;
+            }
+            return false;
+        }
+        // hand-over from the instance of the previously shown tab (payload: origin tab)
+        if pipe_message.name == "vtabs-take-keys" {
+            if !self.keys_on {
+                let origin = pipe_message.payload.as_deref().and_then(|p| p.parse().ok());
+                self.keys_on_here(origin);
                 return true;
             }
             return false;
