@@ -13,11 +13,11 @@ const LEFT_PAD: usize = 1;
 /// sidebar instance reads identically (no per-instance divergence). We add it on
 /// the attention pipe and strip it when the tab is focused; both are `rename_tab`
 /// calls that mutate the shared tab name.
-const MARK_WAITING: &str = " ⏳";
-const MARK_COMPLETED: &str = " ✅";
+const MARK_WAITING: &str = "⏳ ";
+const MARK_COMPLETED: &str = "✅ ";
 /// Ongoing-work state (Claude is running): unlike the attention marks above it
 /// is NOT cleared on focus — it ends when a waiting/completed/clear pipe arrives.
-const MARK_WORKING: &str = " ⚙";
+const MARK_WORKING: &str = "⚙ ";
 
 /// Default sidebar animation frames for `MARK_WORKING` (the tab name carries
 /// only the static marker; the spinner lives purely in the render). Dense
@@ -297,13 +297,21 @@ fn move_in(order: &mut [String], name: &str, delta: isize) -> bool {
     true
 }
 
-/// Split the attention marker off a tab name: "work:api ⏳" -> (Waiting, "work:api").
+/// Split the attention marker off a tab name: "⏳ work:api" -> (Waiting, "work:api").
+/// Markers are prefixes (local change): the state reads first, before the name.
 fn parse_attention(name: &str) -> (Option<Attention>, &str) {
-    if let Some(base) = name.strip_suffix(MARK_WAITING) {
+    if let Some(base) = name.strip_prefix(MARK_WAITING) {
         (Some(Attention::Waiting), base)
-    } else if let Some(base) = name.strip_suffix(MARK_COMPLETED) {
+    } else if let Some(base) = name.strip_prefix(MARK_COMPLETED) {
         (Some(Attention::Completed), base)
-    } else if let Some(base) = name.strip_suffix(MARK_WORKING) {
+    } else if let Some(base) = name.strip_prefix(MARK_WORKING) {
+        (Some(Attention::Working), base)
+    // upstream's suffix form, left on tab names by sessions started before the change
+    } else if let Some(base) = name.strip_suffix(" ⏳") {
+        (Some(Attention::Waiting), base)
+    } else if let Some(base) = name.strip_suffix(" ✅") {
+        (Some(Attention::Completed), base)
+    } else if let Some(base) = name.strip_suffix(" ⚙") {
         (Some(Attention::Working), base)
     } else {
         (None, name)
@@ -621,7 +629,7 @@ impl State {
             }
         }
         for (tab_id, want, marker) in renames {
-            rename_tab_with_id(tab_id as u64, format!("{}{}", want, marker));
+            rename_tab_with_id(tab_id as u64, format!("{}{}", marker, want));
             self.auto_named.insert(tab_id, want);
         }
     }
@@ -658,7 +666,7 @@ impl State {
         if att == Some(attention) {
             return;
         }
-        rename_tab_with_id(t.tab_id as u64, format!("{}{}", base, marker_of(attention)));
+        rename_tab_with_id(t.tab_id as u64, format!("{}{}", marker_of(attention), base));
     }
 
     /// Mark the tab containing `pane_id` as working. Unlike attention marks
@@ -668,7 +676,7 @@ impl State {
         if let Some(t) = self.fresh_tab(pane_id) {
             let (att, base) = parse_attention(&t.name);
             if att != Some(Attention::Working) {
-                rename_tab_with_id(t.tab_id as u64, format!("{}{}", base, MARK_WORKING));
+                rename_tab_with_id(t.tab_id as u64, format!("{}{}", MARK_WORKING, base));
             }
         }
     }
@@ -702,7 +710,7 @@ impl State {
             return;
         }
         let marker = att.map(marker_of).unwrap_or("");
-        rename_tab_with_id(t.tab_id as u64, format!("{}{}", name, marker));
+        rename_tab_with_id(t.tab_id as u64, format!("{}{}", marker, name));
     }
 
     /// Strip a *seen* attention marker from the tab at `pos` (global rename).
@@ -832,7 +840,7 @@ impl State {
             let marker = att.map(marker_of).unwrap_or("");
             rename_tab(
                 t.position as u32 + 1,
-                format!("{}{}{}{}", new, self.separator, label, marker),
+                format!("{}{}{}{}", marker, new, self.separator, label),
             );
         }
         self.migrate_group_state(old, new);
@@ -857,7 +865,7 @@ impl State {
         } else {
             format!("{}{}{}", g, self.separator, new_label)
         };
-        rename_tab(position as u32 + 1, format!("{}{}", name, marker));
+        rename_tab(position as u32 + 1, format!("{}{}", marker, name));
         if let Some(order) = self.tab_order.get_mut(&g) {
             rename_label(order, old_label, new_label);
             self.save_state();
@@ -1541,24 +1549,25 @@ mod tests {
 
     #[test]
     fn parse_attention_variants() {
+        assert_eq!(parse_attention("⏳ work:api"), (Some(Attention::Waiting), "work:api"));
         assert_eq!(parse_attention("work:api ⏳"), (Some(Attention::Waiting), "work:api"));
-        assert_eq!(parse_attention("db ✅"), (Some(Attention::Completed), "db"));
-        assert_eq!(parse_attention("run ⚙"), (Some(Attention::Working), "run"));
+        assert_eq!(parse_attention("✅ db"), (Some(Attention::Completed), "db"));
+        assert_eq!(parse_attention("⚙ run"), (Some(Attention::Working), "run"));
         assert_eq!(parse_attention("plain"), (None, "plain"));
     }
 
     #[test]
     fn markers_roundtrip_for_all_states() {
         for att in [Attention::Waiting, Attention::Working, Attention::Completed] {
-            let name = format!("x:y{}", marker_of(att));
+            let name = format!("{}x:y", marker_of(att));
             assert_eq!(parse_attention(&name), (Some(att), "x:y"));
         }
     }
 
     #[test]
     fn parse_attention_roundtrips_with_set() {
-        let (_, base) = parse_attention("x:y ⏳");
-        assert_eq!(format!("{}{}", base, MARK_WAITING), "x:y ⏳");
+        let (_, base) = parse_attention("⏳ x:y");
+        assert_eq!(format!("{}{}", MARK_WAITING, base), "⏳ x:y");
     }
 
     #[test]
