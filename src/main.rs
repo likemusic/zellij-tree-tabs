@@ -370,6 +370,14 @@ struct State {
     /// still so (a manifest mid tab-close can show a neighbour's panes split
     /// across old and new positions — closing at once hit the wrong tab)
     close_pending: bool,
+    /// `show_single_pane` config key: list the pane under a one-pane tab too
+    show_single_pane: bool,
+    /// plugin pane id -> tab position (tab-bar, floating plugins like the startup
+    /// tip…), so a focused plugin pane also tells which tab is on screen
+    plugin_tab: BTreeMap<u32, usize>,
+    /// tab id -> name the sidebar gave it from its only pane's title; a tab whose
+    /// name no longer matches was renamed by hand and is left alone
+    auto_named: BTreeMap<usize, String>,
 }
 
 enum RenameTarget {
@@ -506,7 +514,7 @@ impl State {
                         active: it.active,
                         attention: it.attention,
                     });
-                    if let Some(panes) = panes.filter(|p| p.len() > 1) {
+                    if let Some(panes) = panes.filter(|p| p.len() > 1 || self.show_single_pane && !p.is_empty()) {
                         for (i, (id, title, focused)) in panes.iter().enumerate() {
                             rows.push(Row::Pane {
                                 id: *id,
@@ -563,7 +571,7 @@ impl State {
     fn refresh_titles(&mut self) -> bool {
         let visible = match get_focused_pane_info() {
             Ok((_, PaneId::Terminal(id))) => self.pane_tab.get(&id) == self.my_tab.as_ref(),
-            Ok((_, PaneId::Plugin(id))) => id == self.my_id,
+            Ok((_, PaneId::Plugin(id))) => self.plugin_tab.get(&id) == self.my_tab.as_ref(),
             Err(_) => false,
         };
         if !visible {
@@ -571,9 +579,6 @@ impl State {
         }
         let mut changed = false;
         for panes in self.tab_panes.values_mut() {
-            if panes.len() < 2 {
-                continue; // not listed in the sidebar
-            }
             for (id, title, _) in panes.iter_mut() {
                 if let Some(info) = get_pane_info(PaneId::Terminal(*id)) {
                     let t = short_title(&info.title);
@@ -584,7 +589,41 @@ impl State {
                 }
             }
         }
+        self.auto_name_tabs();
         changed
+    }
+
+    /// A one-pane tab is named after its pane (Claude's session name, the shell's
+    /// directory) and follows it — unless the tab was renamed by hand. Run by the
+    /// visible instance only: its tab list is fresh (hidden ones miss TabUpdates).
+    fn auto_name_tabs(&mut self) {
+        let mut renames = Vec::new();
+        for t in &self.tabs {
+            let Some(panes) = self.tab_panes.get(&t.position) else { continue };
+            if panes.len() != 1 {
+                continue;
+            }
+            let want = tab_name_from_pane(&panes[0].1);
+            let (att, base) = parse_attention(&t.name);
+            let ours = self.auto_named.get(&t.tab_id).map(String::as_str) == Some(base);
+            if want.is_empty() || base == want {
+                // equal names (e.g. after a session restore) re-adopt the tab
+                if !want.is_empty() {
+                    self.auto_named.insert(t.tab_id, want);
+                }
+                continue;
+            }
+            if is_default_tab_name(base) || ours {
+                let marker = att.map(marker_of).unwrap_or("");
+                renames.push((t.tab_id, want, marker));
+            } else {
+                self.auto_named.remove(&t.tab_id);
+            }
+        }
+        for (tab_id, want, marker) in renames {
+            rename_tab_with_id(tab_id as u64, format!("{}{}", want, marker));
+            self.auto_named.insert(tab_id, want);
+        }
     }
 
     /// Server-fresh info for the tab containing `pane_id`. Pipe-driven renames
@@ -1101,6 +1140,8 @@ impl ZellijPlugin for State {
         self.autogroup_rules = parse_autogroup_rules(&configuration);
         self.spinner = parse_spinner(configuration.get("spinner"));
         self.pinned = configuration.get("pinned").map(String::as_str) != Some("false");
+        self.show_single_pane =
+            configuration.get("show_single_pane").map(String::as_str) == Some("true");
         self.my_id = get_plugin_ids().plugin_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -1208,6 +1249,7 @@ impl ZellijPlugin for State {
                     .and_then(|p| p.plugin_url.clone());
                 self.sidebar_by_tab.clear();
                 self.tab_panes.clear();
+                self.plugin_tab.clear();
                 for (tab_pos, panes) in &manifest.panes {
                     let mut list: Vec<_> = panes
                         .iter()
@@ -1222,6 +1264,7 @@ impl ZellijPlugin for State {
                         if !p.is_plugin {
                             self.pane_tab.insert(p.id, *tab_pos);
                         } else {
+                            self.plugin_tab.insert(p.id, *tab_pos);
                             if p.id == self.my_id {
                                 self.my_tab = Some(*tab_pos);
                                 me_focused = p.is_focused;
@@ -1425,6 +1468,15 @@ fn short_title(title: &str) -> String {
         }
     }
     title.to_string()
+}
+
+/// Tab name from a pane title: without Claude's status glyph (`✳ wsa`, `⠐ wsa`)
+/// and the `…/` of a shortened path.
+fn tab_name_from_pane(title: &str) -> String {
+    let t = title.trim_start_matches(|c: char| {
+        !(c.is_alphanumeric() || c == '~' || c == '/' || c == '.' || c == '…' || c == '_' || c == '-')
+    });
+    t.strip_prefix("…/").unwrap_or(t).trim().to_string()
 }
 
 /// Number of *visible* characters, ignoring ANSI CSI escape sequences (`ESC [ … letter`).
