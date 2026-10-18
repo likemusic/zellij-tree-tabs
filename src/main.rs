@@ -350,6 +350,8 @@ struct State {
     sidebar_by_tab: BTreeMap<usize, u32>,
     /// tab where keyboard mode started — Esc goes back there
     keys_origin: Option<usize>,
+    /// tab position -> its tiled terminal panes (id, title, focused) in screen order
+    tab_panes: BTreeMap<usize, Vec<(u32, String, bool)>>,
 }
 
 enum RenameTarget {
@@ -374,6 +376,9 @@ struct TabItem {
 enum Row {
     Group { name: String, collapsed: bool, count: usize, attention: Option<Attention> },
     Tab { position: usize, label: String, active: bool, attention: Option<Attention> },
+    /// a terminal pane of the tab above, listed when the tab has 2+ panes;
+    /// display + click only — keyboard navigation skips these rows
+    Pane { id: u32, title: String, focused: bool, last: bool },
 }
 
 impl State {
@@ -476,12 +481,23 @@ impl State {
             });
             if !collapsed {
                 for it in items {
+                    let panes = self.tab_panes.get(&it.position);
                     rows.push(Row::Tab {
                         position: it.position,
                         label: it.label,
                         active: it.active,
                         attention: it.attention,
                     });
+                    if let Some(panes) = panes.filter(|p| p.len() > 1) {
+                        for (i, (id, title, focused)) in panes.iter().enumerate() {
+                            rows.push(Row::Pane {
+                                id: *id,
+                                title: title.clone(),
+                                focused: *focused,
+                                last: i + 1 == panes.len(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -634,6 +650,10 @@ impl State {
                 switch_tab_to(*position as u32 + 1);
                 true
             }
+            Row::Pane { id, .. } => {
+                focus_terminal_pane(*id, false, false);
+                true
+            }
         }
     }
 
@@ -688,7 +708,7 @@ impl State {
                 }
                 true
             }
-            None => false,
+            Some(Row::Pane { .. }) | None => false,
         }
     }
 
@@ -786,6 +806,28 @@ impl State {
         true
     }
 
+    /// Next selectable row (group or tab) from `from` in direction `down`;
+    /// stays put at the ends.
+    fn step(rows: &[Row], from: usize, down: bool) -> usize {
+        let mut i = from;
+        loop {
+            if down {
+                if i + 1 >= rows.len() {
+                    return from;
+                }
+                i += 1;
+            } else {
+                if i == 0 {
+                    return from;
+                }
+                i -= 1;
+            }
+            if !matches!(rows[i], Row::Pane { .. }) {
+                return i;
+            }
+        }
+    }
+
     fn keys_on_here(&mut self, origin: Option<usize>) {
         self.keys_on = true;
         self.keys_focus_seen = false;
@@ -861,11 +903,7 @@ impl State {
                 }
                 BareKey::Char('j') | BareKey::Down | BareKey::Char('k') | BareKey::Up if !shift => {
                     let down = matches!(key.bare_key, BareKey::Char('j') | BareKey::Down);
-                    self.selected = if down {
-                        (self.selected + 1).min(len - 1)
-                    } else {
-                        self.selected.saturating_sub(1)
-                    };
+                    self.selected = Self::step(&rows, self.selected, down);
                     if let Some(Row::Tab { position, .. }) = rows.get(self.selected) {
                         if Some(*position) != self.my_tab {
                             self.browse_to(*position);
@@ -883,11 +921,11 @@ impl State {
             BareKey::Down if shift => self.move_selected(1),
             BareKey::Up if shift => self.move_selected(-1),
             BareKey::Char('j') | BareKey::Down => {
-                self.selected = (self.selected + 1).min(len - 1);
+                self.selected = Self::step(&self.build_rows(), self.selected, true);
                 true
             }
             BareKey::Char('k') | BareKey::Up => {
-                self.selected = self.selected.saturating_sub(1);
+                self.selected = Self::step(&self.build_rows(), self.selected, false);
                 true
             }
             BareKey::Enter | BareKey::Char(' ') => {
@@ -907,7 +945,7 @@ impl State {
                             Some((RenameTarget::Tab(*position), label.clone()));
                         true
                     }
-                    None => false,
+                    Some(Row::Pane { .. }) | None => false,
                 }
             }
             _ => false,
@@ -934,11 +972,11 @@ impl State {
                 true
             }
             Mouse::ScrollUp(_) => {
-                self.selected = self.selected.saturating_sub(1);
+                self.selected = Self::step(&self.build_rows(), self.selected, false);
                 true
             }
             Mouse::ScrollDown(_) => {
-                self.selected = (self.selected + 1).min(len - 1);
+                self.selected = Self::step(&self.build_rows(), self.selected, true);
                 true
             }
             _ => false,
@@ -1052,7 +1090,17 @@ impl ZellijPlugin for State {
                     .find(|p| p.is_plugin && p.id == self.my_id)
                     .and_then(|p| p.plugin_url.clone());
                 self.sidebar_by_tab.clear();
+                self.tab_panes.clear();
                 for (tab_pos, panes) in &manifest.panes {
+                    let mut list: Vec<_> = panes
+                        .iter()
+                        .filter(|p| !p.is_plugin && !p.is_floating && !p.is_suppressed)
+                        .collect();
+                    list.sort_by_key(|p| (p.pane_y, p.pane_x));
+                    self.tab_panes.insert(
+                        *tab_pos,
+                        list.iter().map(|p| (p.id, short_title(&p.title), p.is_focused)).collect(),
+                    );
                     for p in panes {
                         if !p.is_plugin {
                             self.pane_tab.insert(p.id, *tab_pos);
@@ -1200,6 +1248,14 @@ impl ZellijPlugin for State {
                         format!("  {} {}{}", dot, self.icon(*attention), label)
                     }
                 }
+                Row::Pane { title, focused, last, .. } => {
+                    let branch = if *last { "└" } else { "├" };
+                    if *focused {
+                        format!("    {} {}", branch, title)
+                    } else {
+                        format!("    \u{1b}[2m{} {}\u{1b}[22m", branch, title)
+                    }
+                }
             };
             let line = truncate_visible(&format!("{}{}", pad, core), cols);
             if i == self.selected {
@@ -1217,6 +1273,21 @@ impl ZellijPlugin for State {
         }
         print!("{}", out);
     }
+}
+
+/// Pane title for the 28-column sidebar: drop the shell's `user@host: ` prefix
+/// (the default bash title), leaving the cwd — `likemusic@PC: ~/a/b` -> `…/b`.
+fn short_title(title: &str) -> String {
+    if let Some((head, rest)) = title.split_once(": ") {
+        if head.contains('@') && !head.contains(char::is_whitespace) {
+            // the meaningful end of a path survives the narrow column: ~/a/b/c -> …/c
+            return match rest.rsplit_once('/') {
+                Some((dir, last)) if !last.is_empty() && dir.contains('/') => format!("…/{}", last),
+                _ => rest.to_string(),
+            };
+        }
+    }
+    title.to_string()
 }
 
 /// Number of *visible* characters, ignoring ANSI CSI escape sequences (`ESC [ … letter`).
