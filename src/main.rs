@@ -571,6 +571,12 @@ impl State {
         }
     }
 
+    /// The icon in a fixed 2-column slot (local change), so names start in the
+    /// same column whether or not a row has a state icon.
+    fn icon_slot(&self, att: Option<Attention>) -> String {
+        if att.is_some() { self.icon(att) } else { "  ".to_string() }
+    }
+
     fn any_working(&self) -> bool {
         self.tabs
             .iter()
@@ -1495,12 +1501,13 @@ impl ZellijPlugin for State {
                     if let Some(buf) = editing {
                         format!("  {} {}▏", dot, buf)
                     } else {
-                        format!("  {} {}{}", dot, self.icon(*attention), label)
+                        format!("  {} {}{}", dot, self.icon_slot(*attention), label)
                     }
                 }
                 Row::Pane { title, focused, last, attention, .. } => {
                     let branch = if *last { "└" } else { "├" };
-                    let icon = self.icon(*attention);
+                    let icon = self.icon_slot(*attention);
+                    let title = strip_claude_glyph(title);
                     if *focused {
                         format!("    {} {}{}", branch, icon, title)
                     } else {
@@ -1553,6 +1560,16 @@ fn tab_name_from_pane(title: &str) -> String {
     match t.split_once(char::is_whitespace) {
         Some((cmd, _)) if cmd.starts_with('/') => cmd.rsplit('/').next().unwrap_or(cmd).to_string(),
         _ => t.to_string(),
+    }
+}
+
+/// Pane title without Claude Code's own status glyph (`✳ wsa`, `⠐ wsa`): the
+/// row's state icon already says it, and `✳` draws as a 2-column emoji.
+fn strip_claude_glyph(title: &str) -> &str {
+    let mut chars = title.chars();
+    match chars.next() {
+        Some(c) if c == '✳' || ('\u{2800}'..='\u{28ff}').contains(&c) => chars.as_str().trim_start(),
+        _ => title,
     }
 }
 
@@ -1727,6 +1744,14 @@ mod tests {
         assert!(!is_default_tab_name("Tab #"));
         assert!(!is_default_tab_name("Tab #1x"));
         assert!(!is_default_tab_name("work:api"));
+    }
+
+    #[test]
+    fn strip_claude_glyph_only_drops_a_leading_status_glyph() {
+        assert_eq!(strip_claude_glyph("✳ rosatom"), "rosatom");
+        assert_eq!(strip_claude_glyph("⠐ wsa"), "wsa");
+        assert_eq!(strip_claude_glyph("…/src"), "…/src");
+        assert_eq!(strip_claude_glyph("a ✳ b"), "a ✳ b");
     }
 
     #[test]
