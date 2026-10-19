@@ -203,6 +203,10 @@ struct Persisted {
     tab_order: BTreeMap<String, Vec<String>>,
     /// `view status` / `view projects` (local change); None: not saved yet
     status_view: Option<bool>,
+    /// `width N` / `width_saved N` (local change): sidebar width in columns, and
+    /// the width to restore when a collapsed sidebar is expanded
+    width: Option<usize>,
+    width_saved: Option<usize>,
 }
 
 /// One line per entry: `order <group>` / `collapsed <group>` /
@@ -226,6 +230,10 @@ fn parse_state(s: &str) -> Persisted {
             }
         } else if let Some(v) = line.strip_prefix("view ") {
             p.status_view = Some(v == "status");
+        } else if let Some(v) = line.strip_prefix("width ") {
+            p.width = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("width_saved ") {
+            p.width_saved = v.parse().ok();
         }
     }
     p
@@ -254,6 +262,12 @@ fn serialize_state(p: &Persisted) -> String {
     }
     if let Some(v) = p.status_view {
         out.push_str(if v { "view status\n" } else { "view projects\n" });
+    }
+    if let Some(w) = p.width {
+        out.push_str(&format!("width {}\n", w));
+    }
+    if let Some(w) = p.width_saved {
+        out.push_str(&format!("width_saved {}\n", w));
     }
     out
 }
@@ -329,6 +343,10 @@ fn parse_attention(name: &str) -> (Option<Attention>, &str) {
 /// Status-view group headers, in display order (local change).
 const STATUS_GROUPS: [&str; 4] = ["Waiting", "Working", "Done", "Idle"];
 
+/// Below this width — or when collapsed — the sidebar draws only state icons
+/// (local change).
+const NARROW_COLS: usize = 8;
+
 #[derive(Default)]
 struct State {
     tabs: Vec<TabInfo>,
@@ -385,6 +403,25 @@ struct State {
     /// grouped by attention state instead of by name prefix; saved in the state
     /// file so every tab's instance shows the same view
     status_view: bool,
+    /// sidebar width (local change, `-` `=` `0` keys): every instance resizes its
+    /// own pane toward `width` — also after a swap layout reset it to the
+    /// layout's size. Zellij resizes in steps (a percentage of the tab), so the
+    /// width lands on the step closest to the target.
+    width: Option<usize>,
+    width_saved: Option<usize>,
+    /// own pane's columns, the full tab width, and the terminal pane right of
+    /// the sidebar (from PaneUpdate)
+    my_cols: usize,
+    full_cols: usize,
+    neighbor: Option<u32>,
+    /// last resize issued: (columns before, increase); observed step size;
+    /// columns and direction in which a resize had no effect (not retried)
+    last_resize: Option<(usize, bool)>,
+    resize_step: usize,
+    width_stuck: Option<(usize, bool)>,
+    /// resizes in a row that had no effect — one sent while a swap layout is
+    /// being applied gets lost, so give up only after a few
+    resize_misses: u8,
     /// interval of the scheduled Timer and time since the last title refresh
     timer_interval: f64,
     title_elapsed: f64,
@@ -484,6 +521,13 @@ impl State {
             if let Some(v) = p.status_view {
                 self.status_view = v;
             }
+            if p.width != self.width {
+                self.width = p.width;
+                self.width_stuck = None;
+                self.resize_misses = 0;
+                self.last_resize = None;
+            }
+            self.width_saved = p.width_saved;
         }
     }
 
@@ -496,6 +540,8 @@ impl State {
             collapsed: self.collapsed.clone(),
             tab_order: self.tab_order.clone(),
             status_view: Some(self.status_view),
+            width: self.width,
+            width_saved: self.width_saved,
         };
         let _ = std::fs::write(path, serialize_state(&p));
     }
@@ -1213,6 +1259,10 @@ impl State {
                 self.activate(sel)
             }
             // Russian layout sends the letter on the same key
+            // width keys are the same on both keyboard layouts
+            BareKey::Char('-') => self.change_width(false),
+            BareKey::Char('=') | BareKey::Char('+') => self.change_width(true),
+            BareKey::Char('0') => self.toggle_collapse(),
             BareKey::Char('v') | BareKey::Char('м') => {
                 self.toggle_view();
                 true
@@ -1243,6 +1293,101 @@ impl State {
             }
             _ => false,
         }
+    }
+
+    /// Resize step in columns: observed, else Zellij's 5% of the tab width.
+    fn step_cols(&self) -> usize {
+        if self.resize_step > 0 {
+            self.resize_step
+        } else {
+            (self.full_cols * 5 / 100).max(1)
+        }
+    }
+
+    /// One step narrower/wider; the new target is saved for every tab's sidebar.
+    fn change_width(&mut self, wider: bool) -> bool {
+        if self.my_cols == 0 {
+            return false;
+        }
+        let step = self.step_cols();
+        let target = if wider {
+            self.my_cols + step
+        } else {
+            self.my_cols.saturating_sub(step).max(1)
+        };
+        self.width = Some(target);
+        self.width_saved = None;
+        self.width_stuck = None;
+        self.resize_misses = 0;
+        self.last_resize = None;
+        self.save_state();
+        self.sync_width(false);
+        true
+    }
+
+    /// Collapse to the narrowest width (icons only), or expand back.
+    fn toggle_collapse(&mut self) -> bool {
+        if let Some(w) = self.width_saved.take() {
+            self.width = Some(w);
+        } else {
+            self.width_saved = Some(self.width.unwrap_or(self.my_cols));
+            self.width = Some(1);
+        }
+        self.width_stuck = None;
+        self.resize_misses = 0;
+        self.last_resize = None;
+        self.save_state();
+        self.sync_width(false);
+        true
+    }
+
+    /// Move own pane one resize step toward `width` if that brings it closer.
+    /// Called on every PaneUpdate, which also reports each step's result, and
+    /// on the 2 s timer (`tick`). One resize at a time: PaneUpdates arrive before
+    /// a resize lands, and resending on each queued up several that then all
+    /// landed at once.
+    fn sync_width(&mut self, tick: bool) {
+        let (Some(target), c) = (self.width, self.my_cols) else { return };
+        if c == 0 {
+            return;
+        }
+        if let Some((before, increase)) = self.last_resize {
+            if c != before {
+                self.last_resize = None;
+                self.resize_misses = 0;
+                self.resize_step = c.abs_diff(before);
+            } else if !tick {
+                return; // still in flight
+            } else {
+                // no effect by the next tick: lost in a relayout, a fixed-size
+                // pane, or the minimum width — retry a few times, then give up
+                // at this width until it or the target changes
+                self.last_resize = None;
+                self.resize_misses += 1;
+                if self.resize_misses >= 3 {
+                    self.width_stuck = Some((c, increase));
+                }
+            }
+        }
+        let step = self.step_cols();
+        let increase = if c < target && (c + step).abs_diff(target) < target - c {
+            true
+        } else if c > target && c.saturating_sub(step).abs_diff(target) < c - target {
+            false
+        } else {
+            return;
+        };
+        if self.width_stuck == Some((c, increase)) {
+            return;
+        }
+        let Some(neighbor) = self.neighbor else { return };
+        // the neighbour gives up (or takes) columns on its left edge
+        let resize = if increase { Resize::Decrease } else { Resize::Increase };
+        resize_pane_with_id(
+            ResizeStrategy { resize, direction: Some(Direction::Left), invert_on_boundaries: false },
+            PaneId::Terminal(neighbor),
+        );
+        self.last_resize = Some((c, increase));
     }
 
     /// Switch project/status view, keeping the selection on the same tab or pane.
@@ -1277,6 +1422,29 @@ impl State {
             .min(rows.len().saturating_sub(1));
     }
 
+    /// A click on a tab or pane row (local change) enters keyboard mode on that
+    /// row instead of focusing it: the tab is shown, a pane's frame highlighted,
+    /// and the arrows go on from there; Enter focuses, Esc stays in that tab.
+    fn click_row(&mut self, rows: &[Row], idx: usize) {
+        let (tab, pane) = match &rows[idx] {
+            Row::Tab { position, .. } => (Some(*position), None),
+            Row::Pane { id, .. } => (self.pane_tab.get(id).copied(), Some(*id)),
+            Row::Group { .. } => return,
+        };
+        let Some(tab) = tab else { return };
+        self.selected = idx;
+        if Some(tab) == self.my_tab {
+            if !self.keys_on {
+                self.keys_on_here(Some(tab));
+            }
+            self.highlight(pane);
+        } else {
+            // the clicked tab is where Esc returns to
+            self.keys_origin = Some(tab);
+            self.browse_to(tab, pane);
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: Mouse) -> bool {
         if self.renaming.take().is_some() {
             return true; // any mouse action cancels an in-progress rename
@@ -1292,8 +1460,13 @@ impl State {
                     return false;
                 }
                 let idx = idx as usize;
-                self.selected = idx;
-                self.activate(idx);
+                let rows = self.build_rows();
+                if matches!(rows[idx], Row::Group { .. }) {
+                    self.selected = idx;
+                    self.activate(idx);
+                } else {
+                    self.click_row(&rows, idx);
+                }
                 true
             }
             Mouse::ScrollUp(_) => {
@@ -1384,6 +1557,8 @@ impl ZellijPlugin for State {
                 // every tab switch fires a TabUpdate, so the visible sidebar
                 // is always freshly synced.
                 self.load_state();
+                // a width set in another tab's sidebar
+                self.sync_width(false);
                 if self.focus_on_show
                     && self.tabs.iter().any(|t| t.active && Some(t.position) == self.my_tab)
                 {
@@ -1436,6 +1611,8 @@ impl ZellijPlugin for State {
                 if self.title_elapsed >= TITLE_INTERVAL {
                     self.title_elapsed = 0.0;
                     redraw |= self.refresh_titles();
+                    // a resize sent during a relayout can get lost: retry from here
+                    self.sync_width(true);
                 }
                 self.ensure_timer();
                 redraw
@@ -1473,12 +1650,28 @@ impl ZellijPlugin for State {
                             if p.id == self.my_id {
                                 self.my_tab = Some(*tab_pos);
                                 me_focused = p.is_focused;
+                                self.my_cols = p.pane_columns;
+                            }
+                            if p.plugin_url.as_deref() == Some("zellij:tab-bar") {
+                                self.full_cols = p.pane_columns;
                             }
                             if my_url.is_some() && p.plugin_url == my_url {
                                 self.sidebar_by_tab.insert(*tab_pos, p.id);
                             }
                         }
                     }
+                }
+                // the leftmost tiled terminal right of the sidebar: resizing it on its
+                // left edge is what moves the sidebar's border (a resize of the
+                // sidebar itself is ignored once a swap layout nests the panes)
+                if let Some(ps) = self.my_tab.and_then(|t| manifest.panes.get(&t)) {
+                    let me = ps.iter().find(|p| p.is_plugin && p.id == self.my_id);
+                    self.neighbor = me.and_then(|me| {
+                        ps.iter()
+                            .filter(|p| !p.is_plugin && !p.is_floating && !p.is_suppressed && p.pane_x > me.pane_x)
+                            .min_by_key(|p| p.pane_x)
+                            .map(|p| p.id)
+                    });
                 }
                 // Auto-close: Zellij keeps a tab while any pane is left, and the sidebar
                 // is one — so `exit` in the last terminal left a tab with just the
@@ -1505,6 +1698,7 @@ impl ZellijPlugin for State {
                         }
                     }
                 }
+                self.sync_width(false);
                 let marks_changed = self.prune_pane_marks();
                 // Outside keyboard mode the bar follows pane focus (Alt+arrows, clicks,
                 // Enter on a pane row) — TabUpdate does not fire for a pane-only change.
@@ -1637,47 +1831,60 @@ impl ZellijPlugin for State {
             print!("{}", out);
             return;
         }
+        // collapsed sidebar (local change): only the state icons, one per row
+        let narrow = self.width_saved.is_some() || cols < NARROW_COLS;
         for (i, row) in visible.iter().enumerate() {
-            let core = match row {
-                Row::Group { name, collapsed, count, attention } => {
-                    let disc = if *collapsed { "▶" } else { "▼" };
-                    let editing = match &self.renaming {
-                        Some((RenameTarget::Group(o), buf)) if o == name => Some(buf),
-                        _ => None,
-                    };
-                    if let Some(buf) = editing {
-                        format!("{} {}▏", disc, buf)
-                    } else {
-                        let icon = if *collapsed { self.icon(*attention) } else { String::new() };
-                        format!("{} {}{} ({})", disc, icon, name, count)
-                    }
+            let core = if narrow {
+                match row {
+                    Row::Group { collapsed: true, attention: Some(a), .. } => self.icon(Some(*a)),
+                    Row::Group { collapsed, .. } => (if *collapsed { "▶" } else { "▼" }).to_string(),
+                    Row::Tab { attention: Some(a), .. } => self.icon(Some(*a)),
+                    Row::Tab { active, .. } => (if *active { "●" } else { "·" }).to_string(),
+                    Row::Pane { attention, .. } => format!(" {}", self.icon_slot(*attention)),
                 }
-                Row::Tab { position, label, active, attention } => {
-                    let dot = if *active { "●" } else { " " };
-                    let editing = match &self.renaming {
-                        Some((RenameTarget::Tab(p), buf)) if p == position => Some(buf),
-                        _ => None,
-                    };
-                    if let Some(buf) = editing {
-                        format!("  {} {}▏", dot, buf)
-                    } else {
-                        format!("  {} {}{}", dot, self.icon_slot(*attention), label)
+            } else {
+                match row {
+                    Row::Group { name, collapsed, count, attention } => {
+                        let disc = if *collapsed { "▶" } else { "▼" };
+                        let editing = match &self.renaming {
+                            Some((RenameTarget::Group(o), buf)) if o == name => Some(buf),
+                            _ => None,
+                        };
+                        if let Some(buf) = editing {
+                            format!("{} {}▏", disc, buf)
+                        } else {
+                            let icon = if *collapsed { self.icon(*attention) } else { String::new() };
+                            format!("{} {}{} ({})", disc, icon, name, count)
+                        }
                     }
-                }
-                Row::Pane { title, focused, last, flat, attention, .. } => {
-                    let branch = if *last { "└" } else { "├" };
-                    let icon = self.icon_slot(*attention);
-                    let title = strip_claude_glyph(title);
-                    if *flat {
-                        let dot = if *focused { "●" } else { " " };
-                        format!("  {} {}{}", dot, icon, title)
-                    } else if *focused {
-                        format!("    {} {}{}", branch, icon, title)
-                    } else {
-                        format!("    \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", branch, icon, title)
+                    Row::Tab { position, label, active, attention } => {
+                        let dot = if *active { "●" } else { " " };
+                        let editing = match &self.renaming {
+                            Some((RenameTarget::Tab(p), buf)) if p == position => Some(buf),
+                            _ => None,
+                        };
+                        if let Some(buf) = editing {
+                            format!("  {} {}▏", dot, buf)
+                        } else {
+                            format!("  {} {}{}", dot, self.icon_slot(*attention), label)
+                        }
+                    }
+                    Row::Pane { title, focused, last, flat, attention, .. } => {
+                        let branch = if *last { "└" } else { "├" };
+                        let icon = self.icon_slot(*attention);
+                        let title = strip_claude_glyph(title);
+                        if *flat {
+                            let dot = if *focused { "●" } else { " " };
+                            format!("  {} {}{}", dot, icon, title)
+                        } else if *focused {
+                            format!("    {} {}{}", branch, icon, title)
+                        } else {
+                            format!("    \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", branch, icon, title)
+                        }
                     }
                 }
             };
+            let pad = if narrow { "" } else { pad.as_str() };
             let line = truncate_visible(&format!("{}{}", pad, core), cols);
             if i == self.selected {
                 let w = visible_width(&line);
@@ -1846,6 +2053,8 @@ mod tests {
             )]
             .into(),
             status_view: Some(true),
+            width: Some(30),
+            width_saved: Some(28),
         };
         assert_eq!(parse_state(&serialize_state(&p)), p);
         assert_eq!(parse_state(""), Persisted::default());

@@ -3,7 +3,7 @@
 // worktree in a new tab already running Claude Code.
 layout {
     pane split_direction="vertical" {
-        pane size=28 borderless=true {
+        pane size="15%" borderless=true {
             plugin location="file:~/.config/zellij/plugins/zellij-vtabs.wasm" {
                 // keep in sync with vtabs.kdl (autogroup_default / autogroup_N)
                 // autogroup_default "repo"

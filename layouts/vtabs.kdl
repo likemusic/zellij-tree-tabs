@@ -3,7 +3,7 @@
 
 layout {
     pane split_direction="vertical" {
-        pane size=28 borderless=true {
+        pane size="15%" borderless=true {
             plugin location="file:~/.config/zellij/plugins/zellij-vtabs.wasm" {
                 // Auto-grouping (needs shell/vtabs-rename.sh piping cwd facts):
                 //   autogroup_default "repo"  — group = git repo name (worktree-aware);
