@@ -226,6 +226,37 @@ echo $ZELLIJ_PANE_ID        # e.g. 3
 zellij pipe --name "zellij-vtabs::waiting::3"
 ```
 
+### Restarting Windows / WSL with Claude sessions
+
+How this fork is used day to day: one Zellij session (`work`) with many Claude Code conversations, which has to come back after a planned or a sudden restart. The sidebar itself needs nothing; the pieces that bring the conversations back are Zellij's session resurrection and [zellij-claude-enhance](https://github.com/Shengfeng233/zellij-claude-enhance) (`claude` aliased to its `claude-zellij` wrapper inside Zellij, plus its `post_command_discovery_hook`).
+
+What survives a restart:
+
+- **Tabs, panes, their cwds and commands**: `session_serialization true` writes a snapshot about once a minute to `~/.cache/zellij/contract_version_1/session_info/<session>/`. Changes from the last minute before a sudden restart can be missing.
+- **Which conversation runs in which pane**: the wrapper keeps a marker per pane in `~/.local/share/claude-zellij/markers/`; on resurrection the hook turns the pane's command into `claude --resume <id>`.
+- **The conversations**: Claude writes each message to its transcript (`~/.claude/projects/<cwd>/<id>.jsonl`) as it goes.
+- **Sidebar order, collapsed groups, the chosen view**: the plugin's state file `vtabs-state-<session>` in Zellij's plugin cache.
+
+What is lost:
+
+- **Turns in flight**: a turn interrupted by the restart is not continued; after resuming, ask Claude to go on.
+- **Per-pane state marks**: kept in memory (and the hook script's counters in `/run/user`, a tmpfs), so after a restart every session starts unmarked until its next signal. Tab-name markers are part of the snapshot and can be stale (a `⚙` on a tab nothing runs in) until that tab's next signal.
+- **Background sessions** (moved there with `←` on an empty prompt): they live in Claude's own daemon, not in a pane. Bring one back with `claude --resume` (pick it from the list) in a pane.
+
+Before a planned restart:
+
+1. Let the running turns finish, or interrupt them (`Esc`). For a long task make sure its notes or handoff file are written.
+2. Quit Zellij (`Ctrl+g`, `Ctrl+q` with the Unlock-First preset). The session is serialized on exit and stays resurrectable. Closing the terminal window instead only detaches (`on_force_close "detach"`): the restart then kills the server and the snapshot is whatever the last periodic write caught.
+3. Optionally `wsl --shutdown` from Windows.
+
+After a restart (planned or not):
+
+1. Open the terminal and WSL as usual.
+2. `zellij ls` shows `work (EXITED - attach to resurrect)`.
+3. `zellij attach work`. Attach, don't start a new session with the same name.
+4. Every resurrected pane waits with its command; press Enter in each Claude pane to run `claude --resume <id>`.
+5. The sidebar fills in marks as sessions send signals again. Background sessions: `claude --resume` in a new pane.
+
 ## Auto-grouping (opt-in)
 
 The plugin can name default-named (`Tab #N`) tabs from each pane's starting directory.
