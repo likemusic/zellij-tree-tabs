@@ -42,7 +42,10 @@ signal=$(
     subagent-start)  subs=$((subs + 1)) ;;
     subagent-stop)   subs=$((subs - 1)); [ "$subs" -lt 0 ] && subs=0 ;;
     stop)            main=0; paused=0 ;;
-    notify)          paused=1 ;;                             # needs input; counts unchanged
+    # Claude also notifies 60 s after a finished turn ("waiting for your input"):
+    # nothing is running then, so it is idle, not a question — keep the check.
+    notify)          [ "$main" = 0 ] && [ "$subs" -le 0 ] && exit 0
+                     paused=1 ;;                             # needs input; counts unchanged
     tool)            [ "$paused" = 1 ] || exit 0; paused=0 ;; # work resumed after the pause
     end)             main=0; subs=0 ;;
     *)               exit 0 ;;

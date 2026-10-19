@@ -6,10 +6,12 @@ A vertical, grouped, collapsible tab sidebar for [Zellij](https://zellij.dev) �
 
 `zellij-tree-tabs` is a fork of [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs), used daily with many Claude Code sessions in one Zellij session (Zellij 0.45, Windows Terminal + WSL). Everything below this section is the upstream README; the changes on the `local` branch are:
 
-- **Pane list under each tab** with two or more panes, titles refreshed every 2 s (Claude's own session titles show up there); `show_single_pane "true"` lists a lone pane too.
-- **Per-pane state icons**: the same `waiting` / `working` / `completed` pipes mark the pane row, not only the tab. The pane you are looking at gets no waiting/completed mark; focusing a pane clears it.
+- **Pane list under each tab** with two or more panes, titles refreshed every 2 s (Claude's own session titles show up there), stacked panes included (Zellij reports a stack's collapsed panes as suppressed); `show_single_pane "true"` lists a lone pane too.
+- **Per-pane state icons**: the same `waiting` / `working` / `completed` pipes mark the pane row, not only the tab. Marks are the session's state, not unread cues: looking at a tab or pane does not clear them, only the next signal does (`clear-working` on SessionEnd clears all).
 - **State markers as prefixes** (`⚙ name` instead of `name ⚙`); old suffix markers are still recognized.
 - **Keyboard mode** (`MessagePlugin … { name "vtabs-focus"; }`, e.g. bound to `Alt+w`): arrows / `j` `k` browse tabs with a live preview and step onto pane rows (the pane frame is highlighted), Enter stays/focuses, Esc returns. Needs the `MessageAndLaunchOtherPlugins` permission for the hand-over between per-tab instances.
+- **Status view** (`v` in keyboard mode, `м` on a Russian layout; `default_view "status"` to start in it): every session (terminal pane) listed under Waiting / Working / Done / Idle, most urgent first, labelled with its title and its tab. The choice is saved, so every tab's sidebar shows the same view; reordering is done in the project view.
+- **Tab state rolls up its panes**: a tab with several sessions shows the most urgent pane state (waiting > working > done), not the last signal.
 - **Selection follows focus**: the highlighted row is the focused pane's row when the active tab lists its panes, also after Alt+arrows and clicks.
 - **Pinned sidebar** (`pinned`, on by default): focus never lands on the sidebar by accident; `pinned "false"` restores upstream behavior.
 - **Auto-named one-pane tabs** follow their pane title (for a command line just the program name) until renamed by hand.

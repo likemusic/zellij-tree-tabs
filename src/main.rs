@@ -201,10 +201,13 @@ struct Persisted {
     order: Vec<String>,
     collapsed: BTreeSet<String>,
     tab_order: BTreeMap<String, Vec<String>>,
+    /// `view status` / `view projects` (local change); None: not saved yet
+    status_view: Option<bool>,
 }
 
 /// One line per entry: `order <group>` / `collapsed <group>` /
-/// `taborder <group>\t<label>` (labels of one group in order, one per line).
+/// `taborder <group>\t<label>` (labels of one group in order, one per line) /
+/// `view status|projects`.
 /// Names may contain anything but a newline (and, for groups, a tab).
 /// Unknown lines are ignored.
 fn parse_state(s: &str) -> Persisted {
@@ -221,6 +224,8 @@ fn parse_state(s: &str) -> Persisted {
                     .or_default()
                     .push(label.to_string());
             }
+        } else if let Some(v) = line.strip_prefix("view ") {
+            p.status_view = Some(v == "status");
         }
     }
     p
@@ -246,6 +251,9 @@ fn serialize_state(p: &Persisted) -> String {
             out.push_str(label);
             out.push('\n');
         }
+    }
+    if let Some(v) = p.status_view {
+        out.push_str(if v { "view status\n" } else { "view projects\n" });
     }
     out
 }
@@ -318,6 +326,9 @@ fn parse_attention(name: &str) -> (Option<Attention>, &str) {
     }
 }
 
+/// Status-view group headers, in display order (local change).
+const STATUS_GROUPS: [&str; 4] = ["Waiting", "Working", "Done", "Idle"];
+
 #[derive(Default)]
 struct State {
     tabs: Vec<TabInfo>,
@@ -356,6 +367,10 @@ struct State {
     prev_focus: Option<u32>,
     keys_on: bool,
     keys_focus_seen: bool,
+    /// keyboard mode was handed over and this tab is being switched to: take
+    /// focus on the TabUpdate that shows it — taken earlier, Zellij gives it back
+    /// to the tab's last pane when the switch lands (local change)
+    focus_on_show: bool,
     /// tab position -> plugin id of the vtabs instance in that tab (from PaneUpdate),
     /// to hand keyboard mode over when browsing switches the visible tab
     sidebar_by_tab: BTreeMap<usize, u32>,
@@ -366,6 +381,10 @@ struct State {
     /// per-pane state from the same pipes as the tab markers (local change), kept
     /// in memory: every instance gets every pipe, so each holds the full map
     pane_attention: BTreeMap<u32, Attention>,
+    /// status view (local change, `v` key / `default_view` config key): tabs
+    /// grouped by attention state instead of by name prefix; saved in the state
+    /// file so every tab's instance shows the same view
+    status_view: bool,
     /// interval of the scheduled Timer and time since the last title refresh
     timer_interval: f64,
     title_elapsed: f64,
@@ -415,7 +434,8 @@ enum Row {
     Tab { position: usize, label: String, active: bool, attention: Option<Attention> },
     /// a terminal pane of the tab above, listed when the tab has 2+ panes;
     /// keyboard mode browses onto it (frame highlighted), Enter/click focuses it
-    Pane { id: u32, title: String, focused: bool, last: bool, attention: Option<Attention> },
+    /// `flat`: a session row of the status view — no tree branch, tab-row indent
+    Pane { id: u32, title: String, focused: bool, last: bool, flat: bool, attention: Option<Attention> },
 }
 
 impl State {
@@ -461,6 +481,9 @@ impl State {
             self.group_order = p.order;
             self.collapsed = p.collapsed;
             self.tab_order = p.tab_order;
+            if let Some(v) = p.status_view {
+                self.status_view = v;
+            }
         }
     }
 
@@ -472,6 +495,7 @@ impl State {
             order: self.display_group_order(),
             collapsed: self.collapsed.clone(),
             tab_order: self.tab_order.clone(),
+            status_view: Some(self.status_view),
         };
         let _ = std::fs::write(path, serialize_state(&p));
     }
@@ -486,7 +510,7 @@ impl State {
                 position: t.position,
                 label: label.to_string(),
                 active: t.active,
-                attention,
+                attention: self.pane_rollup(t.position).or(attention),
             });
         }
         self.display_group_order()
@@ -501,7 +525,86 @@ impl State {
             .collect()
     }
 
+    /// Tab state from its panes' marks (local change): a tab holding several
+    /// Claude sessions shows the most urgent of them, not the last signal. None
+    /// when no pane is marked — the tab name's marker is used then.
+    fn pane_rollup(&self, position: usize) -> Option<Attention> {
+        self.tab_panes.get(&position)?.iter().fold(None, |acc, (id, _, _)| {
+            match self.pane_attention.get(id) {
+                Some(&x) => Some(merge(acc, x)),
+                None => acc,
+            }
+        })
+    }
+
+    /// Status view (local change): every session — each terminal pane — under
+    /// its state, most urgent state first, in project display order. A pane is
+    /// labelled with its title and, dimmed, its tab; a one-pane tab with the
+    /// tab's full name, whose marker also stands in for an unmarked pane.
+    fn status_rows(&self) -> Vec<Row> {
+        let mut buckets: [Vec<Row>; 4] = Default::default();
+        for (g, items) in self.grouped_items() {
+            for it in items {
+                let Some(t) = self.tabs.iter().find(|t| t.position == it.position) else {
+                    continue;
+                };
+                let base = parse_attention(&t.name).1;
+                let tab_label = if base.contains(self.separator) {
+                    format!("{}{}{}", g, self.separator, it.label)
+                } else {
+                    it.label.clone()
+                };
+                let Some(panes) = self.tab_panes.get(&it.position) else { continue };
+                let tab_mark = parse_attention(&t.name).0;
+                for (id, title, focused) in panes {
+                    let (title, attention) = if panes.len() == 1 {
+                        (tab_label.clone(), self.pane_attention.get(id).copied().or(tab_mark))
+                    } else {
+                        let title = strip_claude_glyph(title);
+                        (
+                            format!("{}\u{1b}[2m · {}\u{1b}[22m", title, tab_label),
+                            self.pane_attention.get(id).copied(),
+                        )
+                    };
+                    let b = match attention {
+                        Some(Attention::Waiting) => 0,
+                        Some(Attention::Working) => 1,
+                        Some(Attention::Completed) => 2,
+                        None => 3,
+                    };
+                    buckets[b].push(Row::Pane {
+                        id: *id,
+                        title,
+                        focused: *focused && it.active,
+                        last: false,
+                        flat: true,
+                        attention,
+                    });
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for (name, items) in STATUS_GROUPS.iter().zip(buckets) {
+            if items.is_empty() {
+                continue;
+            }
+            let collapsed = self.collapsed.contains(*name);
+            let attention = items.iter().fold(None, |acc, r| match r {
+                Row::Pane { attention: Some(x), .. } => Some(merge(acc, *x)),
+                _ => acc,
+            });
+            rows.push(Row::Group { name: name.to_string(), collapsed, count: items.len(), attention });
+            if !collapsed {
+                rows.extend(items);
+            }
+        }
+        rows
+    }
+
     fn build_rows(&self) -> Vec<Row> {
+        if self.status_view {
+            return self.status_rows();
+        }
         let mut rows = Vec::new();
         for (g, items) in self.grouped_items() {
             let g = &g;
@@ -532,6 +635,7 @@ impl State {
                                 title: title.clone(),
                                 focused: *focused,
                                 last: i + 1 == panes.len(),
+                                flat: false,
                                 attention: self.pane_attention.get(id).copied(),
                             });
                         }
@@ -547,6 +651,10 @@ impl State {
     /// Enter on a pane), else the active tab's row.
     fn active_row_index(&self) -> Option<usize> {
         let rows = self.build_rows();
+        if self.status_view {
+            // focused is set only for the active tab's focused pane there
+            return rows.iter().position(|r| matches!(r, Row::Pane { focused: true, .. }));
+        }
         let tab = rows.iter().position(|r| matches!(r, Row::Tab { active: true, .. }))?;
         let pane = rows[tab + 1..]
             .iter()
@@ -671,15 +779,8 @@ impl State {
             return;
         };
         let (att, base) = parse_attention(&t.name);
-        // Never mark the tab you're already looking at — you don't need an
-        // attention cue for it, and it keeps set/clear free of any race.
-        // But a working spinner on it still has to END now.
-        if t.active {
-            if att == Some(Attention::Working) {
-                rename_tab_with_id(t.tab_id as u64, base.to_string());
-            }
-            return;
-        }
+        // The tab you're looking at is marked too (local change): the mark is
+        // the session's state, not an unread cue — only the next signal ends it.
         if att == Some(attention) {
             return;
         }
@@ -698,17 +799,17 @@ impl State {
         }
     }
 
-    /// Same signal, per pane (local change). Rules mirror the tab markers: the
-    /// pane you're looking at gets no waiting/completed mark; true if it changed.
+    /// Same signal, per pane (local change): the pane's session state, kept
+    /// until the next signal — looking at the pane does not clear it. True if
+    /// it changed.
     fn set_pane_attention(&mut self, pane_id: u32, signal: &str) -> bool {
-        let seen = matches!(get_focused_pane_info(), Ok((_, PaneId::Terminal(id))) if id == pane_id);
         let old = self.pane_attention.get(&pane_id).copied();
         let new = match signal {
             "working" => Some(Attention::Working),
-            "waiting" if !seen => Some(Attention::Waiting),
-            "completed" if !seen => Some(Attention::Completed),
-            "waiting" | "completed" => None,
-            "clear-working" if old == Some(Attention::Working) => None,
+            "waiting" => Some(Attention::Waiting),
+            "completed" => Some(Attention::Completed),
+            // the session ended: no state left to show
+            "clear-working" => None,
             _ => return false,
         };
         match new {
@@ -718,30 +819,19 @@ impl State {
         new != old
     }
 
-    /// Focus on a pane means it's seen: drop its waiting/completed mark, and
-    /// forget panes that are gone. True if anything changed.
-    fn clear_seen_panes(&mut self) -> bool {
-        let focused = match get_focused_pane_info() {
-            Ok((_, PaneId::Terminal(id))) => Some(id),
-            _ => None,
-        };
+    /// Forget the marks of panes that are gone. True if anything changed.
+    fn prune_pane_marks(&mut self) -> bool {
         let before = self.pane_attention.len();
-        let seen_mark = focused.and_then(|id| self.pane_attention.get(&id).copied());
         let pane_tab = &self.pane_tab;
         self.pane_attention.retain(|id, _| pane_tab.contains_key(id));
-        if let (Some(id), Some(a)) = (focused, seen_mark) {
-            if a != Attention::Working {
-                self.pane_attention.remove(&id);
-            }
-        }
         self.pane_attention.len() != before
     }
 
-    /// Strip a working marker (Claude exited without a Stop) — attention marks stay.
+    /// The session ended (SessionEnd): strip whatever marker the tab has.
     fn clear_working(&self, pane_id: u32) {
         if let Some(t) = self.fresh_tab(pane_id) {
             let (att, base) = parse_attention(&t.name);
-            if att == Some(Attention::Working) {
+            if att.is_some() {
                 rename_tab_with_id(t.tab_id as u64, base.to_string());
             }
         }
@@ -767,18 +857,6 @@ impl State {
         }
         let marker = att.map(marker_of).unwrap_or("");
         rename_tab_with_id(t.tab_id as u64, format!("{}{}", marker, name));
-    }
-
-    /// Strip a *seen* attention marker from the tab at `pos` (global rename).
-    /// A working spinner survives focus — peeking at a running task must not
-    /// kill its indicator; only waiting/completed are "acknowledged by looking".
-    fn clear_tab(&self, pos: usize) {
-        if let Some(t) = self.tabs.iter().find(|t| t.position == pos) {
-            let (att, base) = parse_attention(&t.name);
-            if matches!(att, Some(Attention::Waiting) | Some(Attention::Completed)) {
-                rename_tab_with_id(t.tab_id as u64, base.to_string());
-            }
-        }
     }
 
     fn activate(&mut self, idx: usize) -> bool {
@@ -810,6 +888,10 @@ impl State {
     /// Move the row under the selection up/down (persisted): a group header
     /// reorders the group, a tab row reorders the tab within its group.
     fn move_selected(&mut self, delta: isize) -> bool {
+        // status groups are fixed and derived; order is set in the project view
+        if self.status_view {
+            return false;
+        }
         let rows = self.build_rows();
         match rows.get(self.selected) {
             Some(Row::Group { name, .. }) => {
@@ -1004,13 +1086,16 @@ impl State {
         };
         let origin = self.keys_origin;
         self.keys_off(false);
-        switch_tab_to(position as u32 + 1);
         // payload "origin_tab:pane_id", either part may be empty
         let payload = format!(
             "{}:{}",
             origin.map(|o| o.to_string()).unwrap_or_default(),
             pane.map(|p| p.to_string()).unwrap_or_default()
         );
+        // No switch_tab_to here (local change): the other instance switches to its
+        // own tab on take-keys, after it has selected the row. Switching from here
+        // showed its old selection first (a flash of the focused pane's row): the
+        // pipe arrives after the TabUpdate.
         pipe_message_to_plugin(
             MessageToPlugin::new("vtabs-take-keys")
                 .with_destination_plugin_id(target)
@@ -1044,6 +1129,7 @@ impl State {
 
     fn keys_off(&mut self, restore_focus: bool) {
         self.keys_on = false;
+        self.focus_on_show = false;
         self.keys_focus_seen = false;
         self.pending_pane = None;
         self.highlight(None);
@@ -1126,17 +1212,30 @@ impl State {
                 let sel = self.selected;
                 self.activate(sel)
             }
+            // Russian layout sends the letter on the same key
+            BareKey::Char('v') | BareKey::Char('м') => {
+                self.toggle_view();
+                true
+            }
             BareKey::Char('r') => {
                 let rows = self.build_rows();
                 match rows.get(self.selected) {
+                    Some(Row::Group { .. }) if self.status_view => false,
                     Some(Row::Group { name, .. }) => {
                         self.renaming =
                             Some((RenameTarget::Group(name.clone()), name.clone()));
                         true
                     }
-                    Some(Row::Tab { position, label, .. }) => {
-                        self.renaming =
-                            Some((RenameTarget::Tab(*position), label.clone()));
+                    Some(Row::Tab { position, .. }) => {
+                        // the label without its group prefix, even in the status view
+                        let label = self
+                            .grouped_items()
+                            .into_iter()
+                            .flat_map(|(_, items)| items)
+                            .find(|it| it.position == *position)
+                            .map(|it| it.label)
+                            .unwrap_or_default();
+                        self.renaming = Some((RenameTarget::Tab(*position), label));
                         true
                     }
                     Some(Row::Pane { .. }) | None => false,
@@ -1144,6 +1243,38 @@ impl State {
             }
             _ => false,
         }
+    }
+
+    /// Switch project/status view, keeping the selection on the same tab or pane.
+    fn toggle_view(&mut self) {
+        let keep = self.selected_key();
+        self.status_view = !self.status_view;
+        self.save_state();
+        self.reselect(keep);
+    }
+
+    /// What the selection is on — (tab position, pane id, group name) — to find
+    /// it again after the rows change.
+    fn selected_key(&self) -> (Option<usize>, Option<u32>, Option<String>) {
+        match self.build_rows().get(self.selected) {
+            Some(Row::Tab { position, .. }) => (Some(*position), None, None),
+            Some(Row::Pane { id, .. }) => (None, Some(*id), None),
+            Some(Row::Group { name, .. }) => (None, None, Some(name.clone())),
+            None => (None, None, None),
+        }
+    }
+
+    fn reselect(&mut self, (tab, pane, group): (Option<usize>, Option<u32>, Option<String>)) {
+        let rows = self.build_rows();
+        let idx = rows.iter().position(|r| match r {
+            Row::Tab { position, .. } => tab == Some(*position),
+            Row::Pane { id, .. } => pane == Some(*id),
+            Row::Group { name, .. } => group.as_ref() == Some(name),
+        });
+        self.selected = idx
+            .or_else(|| self.active_row_index())
+            .unwrap_or(0)
+            .min(rows.len().saturating_sub(1));
     }
 
     fn handle_mouse(&mut self, mouse: Mouse) -> bool {
@@ -1206,6 +1337,9 @@ impl ZellijPlugin for State {
         self.pinned = configuration.get("pinned").map(String::as_str) != Some("false");
         self.show_single_pane =
             configuration.get("show_single_pane").map(String::as_str) == Some("true");
+        // the state file's saved view, once loaded, wins over this default
+        self.status_view =
+            configuration.get("default_view").map(String::as_str) == Some("status");
         self.my_id = get_plugin_ids().plugin_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -1250,12 +1384,14 @@ impl ZellijPlugin for State {
                 // every tab switch fires a TabUpdate, so the visible sidebar
                 // is always freshly synced.
                 self.load_state();
-                // Clear on focus: the active tab is "seen", so strip its marker.
-                // Safe on every TabUpdate because set_attention never marks the
-                // active tab, so there's no marker here to race with.
-                if let Some(pos) = self.tabs.iter().find(|t| t.active).map(|t| t.position) {
-                    self.clear_tab(pos);
+                if self.focus_on_show
+                    && self.tabs.iter().any(|t| t.active && Some(t.position) == self.my_tab)
+                {
+                    self.focus_on_show = false;
+                    self.keys_on_here(self.keys_origin);
                 }
+                // No clear on focus (local change): markers are session state,
+                // ended only by the next signal.
                 // Keyboard mode: keep a selection already inside this tab — TabUpdates
                 // also fire on pane highlight/focus changes, and resetting to the tab
                 // row there made browsing bounce back to the first panes.
@@ -1263,7 +1399,9 @@ impl ZellijPlugin for State {
                     && match self.build_rows().get(self.selected) {
                         Some(Row::Tab { position, .. }) => Some(*position) == self.my_tab,
                         Some(Row::Pane { id, .. }) => self.pane_tab.get(id) == self.my_tab.as_ref(),
-                        _ => false,
+                        // a header belongs to no tab: browsing onto it switches nothing
+                        Some(Row::Group { .. }) => true,
+                        None => false,
                     };
                 if self.pending_pane.is_some() {
                     self.select_pending_pane();
@@ -1317,9 +1455,12 @@ impl ZellijPlugin for State {
                 for (tab_pos, panes) in &manifest.panes {
                     let mut list: Vec<_> = panes
                         .iter()
-                        .filter(|p| !p.is_plugin && !p.is_floating && !p.is_suppressed)
+                        // suppressed too (local change): Zellij 0.45 reports the
+                        // collapsed panes of a stack as suppressed
+                        .filter(|p| !p.is_plugin && !p.is_floating)
                         .collect();
-                    list.sort_by_key(|p| (p.pane_y, p.pane_x));
+                    // a stack's panes share their position; id keeps them in stack order
+                    list.sort_by_key(|p| (p.pane_y, p.pane_x, p.id));
                     self.tab_panes.insert(
                         *tab_pos,
                         list.iter().map(|p| (p.id, short_title(&p.title), p.is_focused)).collect(),
@@ -1364,7 +1505,7 @@ impl ZellijPlugin for State {
                         }
                     }
                 }
-                let marks_changed = self.clear_seen_panes();
+                let marks_changed = self.prune_pane_marks();
                 // Outside keyboard mode the bar follows pane focus (Alt+arrows, clicks,
                 // Enter on a pane row) — TabUpdate does not fire for a pane-only change.
                 if !self.keys_on && self.pending_pane.is_none() {
@@ -1416,11 +1557,24 @@ impl ZellijPlugin for State {
         // hand-over from the instance of the previously shown tab (payload: origin tab)
         if pipe_message.name == "vtabs-take-keys" {
             if !self.keys_on {
+                // a hidden instance may not have read the view switched elsewhere
+                self.load_state();
                 let (origin, pane) = pipe_message.payload.as_deref().unwrap_or("").split_once(':').unwrap_or(("", ""));
-                self.keys_on_here(origin.parse().ok());
+                // select before switching: this tab shows with the row already chosen
                 if let Ok(id) = pane.parse::<u32>() {
                     self.pending_pane = Some(id);
                     self.select_pending_pane();
+                } else if let Some(i) = self.build_rows().iter().position(
+                    |r| matches!(r, Row::Tab { position, .. } if Some(*position) == self.my_tab),
+                ) {
+                    self.selected = i;
+                }
+                self.keys_on = true;
+                self.keys_focus_seen = false;
+                self.keys_origin = origin.parse().ok();
+                self.focus_on_show = true;
+                if let Some(t) = self.my_tab {
+                    switch_tab_to(t as u32 + 1);
                 }
                 return true;
             }
@@ -1431,7 +1585,13 @@ impl ZellijPlugin for State {
             if parts.len() == 2 {
                 if let Ok(pane_id) = parts[1].parse::<u32>() {
                     let payload = pipe_message.payload.as_deref().unwrap_or("");
+                    // the status view regroups rows on a state change — keep the
+                    // selection on the same row, not the same index
+                    let keep = self.selected_key();
                     let pane_changed = self.set_pane_attention(pane_id, parts[0]);
+                    if pane_changed {
+                        self.reselect(keep);
+                    }
                     match parts[0] {
                         "waiting" => {
                             self.set_attention(pane_id, Attention::Waiting);
@@ -1504,11 +1664,14 @@ impl ZellijPlugin for State {
                         format!("  {} {}{}", dot, self.icon_slot(*attention), label)
                     }
                 }
-                Row::Pane { title, focused, last, attention, .. } => {
+                Row::Pane { title, focused, last, flat, attention, .. } => {
                     let branch = if *last { "└" } else { "├" };
                     let icon = self.icon_slot(*attention);
                     let title = strip_claude_glyph(title);
-                    if *focused {
+                    if *flat {
+                        let dot = if *focused { "●" } else { " " };
+                        format!("  {} {}{}", dot, icon, title)
+                    } else if *focused {
                         format!("    {} {}{}", branch, icon, title)
                     } else {
                         format!("    \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", branch, icon, title)
@@ -1525,7 +1688,10 @@ impl ZellijPlugin for State {
                 };
                 out.push_str(&format!("\u{1b}[7m{}\u{1b}[0m", bar));
             } else {
+                // truncation can cut off a closing escape (a dimmed tail) —
+                // don't let it bleed into the rows below
                 out.push_str(&line);
+                out.push_str("\u{1b}[0m");
             }
             out.push_str("\r\n");
         }
@@ -1679,6 +1845,7 @@ mod tests {
                 vec!["db".to_string(), "api".to_string()],
             )]
             .into(),
+            status_view: Some(true),
         };
         assert_eq!(parse_state(&serialize_state(&p)), p);
         assert_eq!(parse_state(""), Persisted::default());
@@ -1833,6 +2000,46 @@ mod tests {
         let default: Vec<String> = SPINNER_DEFAULT.chars().map(String::from).collect();
         assert_eq!(parse_spinner(None), default);
         assert_eq!(parse_spinner(Some(&"  ".to_string())), default); // whitespace-only
+    }
+
+    #[test]
+    fn status_view_lists_sessions_under_their_state() {
+        let tab = |position: usize, name: &str| TabInfo {
+            position,
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let pane = |id: u32, title: &str| (id, title.to_string(), false);
+        let s = State {
+            separator: ':',
+            status_view: true,
+            tabs: vec![
+                tab(0, &format!("{}work:api", MARK_COMPLETED)),
+                tab(1, "notes"),
+            ],
+            tab_panes: [
+                (0, vec![pane(1, "a"), pane(2, "b"), pane(3, "c")]),
+                (1, vec![pane(4, "notes")]),
+            ]
+            .into(),
+            pane_attention: [(1, Attention::Working), (3, Attention::Waiting)].into(),
+            ..Default::default()
+        };
+        let got: Vec<String> = s
+            .build_rows()
+            .iter()
+            .map(|r| match r {
+                Row::Group { name, .. } => name.clone(),
+                Row::Pane { title, .. } => format!("  {}", title.split('\u{1b}').next().unwrap()),
+                Row::Tab { .. } => "tab?".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            ["Waiting", "  c", "Working", "  a", "Idle", "  b", "  notes"]
+        );
+        // the tab rolls its panes up (waiting wins) over its own completed marker
+        assert_eq!(s.pane_rollup(0), Some(Attention::Waiting));
     }
 
     #[test]
