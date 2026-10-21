@@ -793,10 +793,13 @@ impl State {
         self.pane_background.get(&pane_id).copied() != old
     }
 
+    /// Whether the spinner must turn: a working pane mark counts too (local
+    /// change). The tab name carries only the last signal of its panes, so a tab
+    /// whose one pane finished while the others still work read as done, and
+    /// with no `⚙` left in any name every spinner froze.
     fn any_working(&self) -> bool {
-        self.tabs
-            .iter()
-            .any(|t| parse_attention(&t.name).0 == Some(Attention::Working))
+        self.pane_attention.iter().any(|(id, a)| *a == Attention::Working && self.pane_tab.contains_key(id))
+            || self.tabs.iter().any(|t| parse_attention(&t.name).0 == Some(Attention::Working))
     }
 
     /// Arm the animation timer if something is working and none is scheduled.
@@ -927,14 +930,13 @@ impl State {
         new != old
     }
 
-    /// Forget the marks of panes that are gone. True if anything changed.
-    fn prune_pane_marks(&mut self) -> bool {
-        let before = self.pane_attention.len();
-        let pane_tab = &self.pane_tab;
-        self.pane_attention.retain(|id, _| pane_tab.contains_key(id));
-        let bg_before = self.pane_background.len();
-        self.pane_background.retain(|id, _| pane_tab.contains_key(id));
-        self.pane_attention.len() != before || self.pane_background.len() != bg_before
+    /// Forget the marks of a closed pane (local change: on PaneClosed, not on
+    /// every PaneUpdate — a pane briefly missing from one, e.g. while a stack
+    /// expands, lost its mark until the next signal). True if anything changed.
+    fn forget_pane(&mut self, id: u32) -> bool {
+        let a = self.pane_attention.remove(&id).is_some();
+        let b = self.pane_background.remove(&id).is_some();
+        a || b
     }
 
     /// The session ended (SessionEnd): strip whatever marker the tab has.
@@ -1667,6 +1669,7 @@ impl ZellijPlugin for State {
             EventType::Timer,
             EventType::PermissionRequestResult,
             EventType::SessionUpdate,
+            EventType::PaneClosed,
         ]);
         self.ensure_timer();
     }
@@ -1742,6 +1745,7 @@ impl ZellijPlugin for State {
                 self.ensure_timer();
                 true
             }
+            Event::PaneClosed(PaneId::Terminal(id)) => self.forget_pane(id),
             Event::Timer(_) => {
                 if self.close_pending {
                     self.close_pending = false;
@@ -1856,7 +1860,6 @@ impl ZellijPlugin for State {
                     }
                 }
                 self.sync_width(false);
-                let marks_changed = self.prune_pane_marks();
                 // Outside keyboard mode the bar follows pane focus (Alt+arrows, clicks,
                 // Enter on a pane row) — TabUpdate does not fire for a pane-only change.
                 if !self.keys_on && self.pending_pane.is_none() {
@@ -1879,7 +1882,7 @@ impl ZellijPlugin for State {
                         return true;
                     }
                 }
-                marks_changed
+                false
             }
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -1907,33 +1910,34 @@ impl ZellijPlugin for State {
         }
         // hand-over from the instance of the previously shown tab (payload: origin tab)
         if pipe_message.name == "vtabs-take-keys" {
-            if !self.keys_on {
-                // a hidden instance may not have read the view switched elsewhere
-                self.load_state();
-                let mut parts = pipe_message.payload.as_deref().unwrap_or("").split(':');
-                let (origin, pane) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-                if self.my_tab.is_none() {
-                    self.my_tab = parts.next().and_then(|t| t.parse().ok());
-                }
-                // select before switching: this tab shows with the row already chosen
-                if let Ok(id) = pane.parse::<u32>() {
-                    self.pending_pane = Some(id);
-                    self.select_pending_pane();
-                } else if let Some(i) = self.build_rows().iter().position(
-                    |r| matches!(r, Row::Tab { position, .. } if Some(*position) == self.my_tab),
-                ) {
-                    self.selected = i;
-                }
-                self.keys_on = true;
-                self.keys_focus_seen = false;
-                self.keys_origin = origin.parse().ok();
-                self.focus_on_show = true;
-                if let Some(t) = self.my_tab {
-                    switch_tab_to(t as u32 + 1);
-                }
-                return true;
+            // Taken even when this instance still believes it holds the keys (local
+            // change): it may have been left through the tab bar or Alt+arrows while
+            // in keyboard mode, and a hidden instance never hears that it lost them.
+            // Ignoring the hand-over then made a click on its rows do nothing.
+            // a hidden instance may not have read the view switched elsewhere
+            self.load_state();
+            let mut parts = pipe_message.payload.as_deref().unwrap_or("").split(':');
+            let (origin, pane) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            if self.my_tab.is_none() {
+                self.my_tab = parts.next().and_then(|t| t.parse().ok());
             }
-            return false;
+            // select before switching: this tab shows with the row already chosen
+            if let Ok(id) = pane.parse::<u32>() {
+                self.pending_pane = Some(id);
+                self.select_pending_pane();
+            } else if let Some(i) = self.build_rows().iter().position(
+                |r| matches!(r, Row::Tab { position, .. } if Some(*position) == self.my_tab),
+            ) {
+                self.selected = i;
+            }
+            self.keys_on = true;
+            self.keys_focus_seen = false;
+            self.keys_origin = origin.parse().ok();
+            self.focus_on_show = true;
+            if let Some(t) = self.my_tab {
+                switch_tab_to(t as u32 + 1);
+            }
+            return true;
         }
         if let Some(rest) = pipe_message.name.strip_prefix("zellij-vtabs::") {
             let parts: Vec<&str> = rest.split("::").collect();
