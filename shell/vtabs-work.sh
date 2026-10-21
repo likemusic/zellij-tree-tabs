@@ -25,7 +25,8 @@
 event="$1"
 dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/zellij-vtabs"
 mkdir -p "$dir" 2>/dev/null || exit 0
-state="$dir/pane-$ZELLIJ_PANE_ID"
+# pane ids restart at 0 in every Zellij session: key the state by session too
+state="$dir/pane-${ZELLIJ_SESSION_NAME:-}-$ZELLIJ_PANE_ID"
 
 # Atomic read-modify-write of the "main subs" counts under a lock, then decide
 # which signal to emit. The lock is held only for the bookkeeping, never for the
@@ -33,14 +34,17 @@ state="$dir/pane-$ZELLIJ_PANE_ID"
 signal=$(
   exec 9>"$state.lock"
   flock 9
-  main=0; subs=0; paused=0
+  main=0; subs=0; paused=0; skip=
   [ -f "$state" ] && read -r main subs paused < "$state" 2>/dev/null
   : "${main:=0}" "${subs:=0}" "${paused:=0}"
   case "$main$subs$paused" in *[!0-9]*) main=0; subs=0; paused=0 ;; esac
   case "$event" in
     prompt)          main=1; subs=0; paused=0 ;;             # new user turn: start fresh
     subagent-start)  subs=$((subs + 1)) ;;
-    subagent-stop)   subs=$((subs - 1)); [ "$subs" -lt 0 ] && subs=0 ;;
+    # SubagentStop also comes for Claude's internal agents, with no SubagentStart
+    # and often after Stop: once the turn is over it must not relight the spinner.
+    subagent-stop)   subs=$((subs - 1)); [ "$subs" -lt 0 ] && subs=0
+                     [ "$main" = 0 ] && [ "$subs" = 0 ] && skip=1 ;;
     stop)            main=0; paused=0 ;;
     # Claude also notifies 60 s after a finished turn ("waiting for your input"):
     # nothing is running then, so it is idle, not a question — keep the check.
@@ -55,6 +59,7 @@ signal=$(
   else
     printf '%s %s %s\n' "$main" "$subs" "$paused" > "$state"
   fi
+  [ -n "$skip" ] && exit 0
   # Only `stop` (main-turn end) with no outstanding subagents shows the check.
   # subagent-stop never completes — the main agent is re-invoked to process the
   # result and its own `stop` finalizes, so the spinner survives the tail too.
@@ -65,6 +70,13 @@ signal=$(
     *)      echo working ;;
   esac
 )
+
+# Background work (local change): a watcher per pane shows the shell commands and
+# monitors Claude keeps running after the turn; a no-op when one already runs.
+case "$event" in
+  tool|stop|prompt) [ -z "$VTABS_WORK_DRYRUN" ] && [ -x "${0%/*}/vtabs-bg.sh" ] \
+                      && setsid "${0%/*}/vtabs-bg.sh" < /dev/null > /dev/null 2>&1 & ;;
+esac
 
 [ -n "$signal" ] || exit 0
 

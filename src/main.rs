@@ -363,10 +363,19 @@ struct State {
     separator: char,
     waiting_icon: String,
     completed_icon: String,
+    /// background-work column icons (local change, `shell_icon` / `monitor_icon`)
+    shell_icon: String,
+    monitor_icon: String,
     autogroup_default: AutoDefault,
     autogroup_rules: Vec<(String, String)>,
     /// active inline rename edit: (target, input buffer)
     renaming: Option<(RenameTarget, String)>,
+    /// `m` on a tab (local change): (tab id, tab name) waiting for a digit that
+    /// picks the session to move it to; `sessions` are the other running ones
+    moving: Option<(usize, String)>,
+    sessions: Vec<String>,
+    /// `move_tab_command` config key: the script that does the move
+    move_command: String,
     /// animation frames (from the `spinner` config key), frame counter, and
     /// whether a Timer event is already scheduled
     spinner: Vec<String>,
@@ -399,6 +408,12 @@ struct State {
     /// per-pane state from the same pipes as the tab markers (local change), kept
     /// in memory: every instance gets every pipe, so each holds the full map
     pane_attention: BTreeMap<u32, Attention>,
+    /// per-pane background work of its Claude session (local change, from
+    /// vtabs-bg.sh): shell commands and monitors still running, so a finished
+    /// turn that waits on them reads apart from an idle one
+    pane_background: BTreeMap<u32, (u16, u16)>,
+    /// terminal panes collapsed in a stack (Zellij reports them as suppressed)
+    stacked_collapsed: BTreeSet<u32>,
     /// status view (local change, `v` key / `default_view` config key): tabs
     /// grouped by attention state instead of by name prefix; saved in the state
     /// file so every tab's instance shows the same view
@@ -731,6 +746,53 @@ impl State {
         if att.is_some() { self.icon(att) } else { "  ".to_string() }
     }
 
+    /// Background work of panes (local change): shells and monitors summed.
+    fn background_of<'a>(&self, panes: impl IntoIterator<Item = &'a u32>) -> (u16, u16) {
+        panes.into_iter().fold((0, 0), |(s, m), id| {
+            let (a, b) = self.pane_background.get(id).copied().unwrap_or((0, 0));
+            (s + a, m + b)
+        })
+    }
+
+    /// The background-work column (local change): one cell for shell commands,
+    /// one for monitors, right after the state icon. Always reserved: a column
+    /// that came and went with the work shifted every name sideways.
+    fn background_slot(&self, bg: (u16, u16)) -> String {
+        let cell = |n: u16, icon: &str, color: u8| {
+            if n == 0 {
+                " ".to_string()
+            } else {
+                format!("\u{1b}[{}m{}\u{1b}[39m", color, icon)
+            }
+        };
+        format!("{}{}", cell(bg.0, &self.shell_icon, 35), cell(bg.1, &self.monitor_icon, 34))
+    }
+
+    /// State icon and background cells in one fixed 4-column slot (local change).
+    fn state_slot(&self, att: Option<Attention>, bg: (u16, u16)) -> String {
+        let glyph = if att.is_some() { self.icon(att).trim_end().to_string() } else { " ".to_string() };
+        format!("{}{} ", glyph, self.background_slot(bg))
+    }
+
+    /// Background work of a tab row: the sum over its panes.
+    fn tab_background(&self, position: usize) -> (u16, u16) {
+        let panes = self.tab_panes.get(&position);
+        self.background_of(panes.into_iter().flatten().map(|(id, _, _)| id))
+    }
+
+    /// `background` pipe (payload "<shells> <monitors>"). True if it changed.
+    fn set_pane_background(&mut self, pane_id: u32, payload: &str) -> bool {
+        let mut it = payload.split_whitespace().map(|n| n.parse::<u16>().unwrap_or(0));
+        let bg = (it.next().unwrap_or(0), it.next().unwrap_or(0));
+        let old = self.pane_background.get(&pane_id).copied();
+        if bg == (0, 0) {
+            self.pane_background.remove(&pane_id);
+        } else {
+            self.pane_background.insert(pane_id, bg);
+        }
+        self.pane_background.get(&pane_id).copied() != old
+    }
+
     fn any_working(&self) -> bool {
         self.tabs
             .iter()
@@ -870,7 +932,9 @@ impl State {
         let before = self.pane_attention.len();
         let pane_tab = &self.pane_tab;
         self.pane_attention.retain(|id, _| pane_tab.contains_key(id));
-        self.pane_attention.len() != before
+        let bg_before = self.pane_background.len();
+        self.pane_background.retain(|id, _| pane_tab.contains_key(id));
+        self.pane_attention.len() != before || self.pane_background.len() != bg_before
     }
 
     /// The session ended (SessionEnd): strip whatever marker the tab has.
@@ -1104,6 +1168,17 @@ impl State {
         self.highlighted = pane;
     }
 
+    /// Browsing onto a pane collapsed in a stack (local change): its frame can't
+    /// be seen, so expand it — focus it, which is what unfolds a stack, and take
+    /// the focus straight back so the keys stay in the sidebar.
+    fn expand_if_stacked(&mut self, pane: Option<u32>) {
+        let Some(id) = pane.filter(|id| self.stacked_collapsed.contains(id)) else { return };
+        // the round trip must not read as "focus left the sidebar"
+        self.keys_focus_seen = false;
+        focus_terminal_pane(id, false, false);
+        focus_plugin_pane(self.my_id, false, false);
+    }
+
     fn select_pending_pane(&mut self) {
         let Some(id) = self.pending_pane else { return };
         if let Some(i) = self
@@ -1132,11 +1207,14 @@ impl State {
         };
         let origin = self.keys_origin;
         self.keys_off(false);
-        // payload "origin_tab:pane_id", either part may be empty
+        // payload "origin_tab:pane_id:target_tab", the first two may be empty; the
+        // target's own tab goes along — an instance in a tab not shown since a
+        // plugin reload may not have had a PaneUpdate to learn it from
         let payload = format!(
-            "{}:{}",
+            "{}:{}:{}",
             origin.map(|o| o.to_string()).unwrap_or_default(),
-            pane.map(|p| p.to_string()).unwrap_or_default()
+            pane.map(|p| p.to_string()).unwrap_or_default(),
+            position
         );
         // No switch_tab_to here (local change): the other instance switches to its
         // own tab on take-keys, after it has selected the row. Switching from here
@@ -1167,6 +1245,7 @@ impl State {
                     self.browse_to(tab.unwrap(), Some(*id));
                 } else {
                     self.highlight(Some(*id));
+                    self.expand_if_stacked(Some(*id));
                 }
             }
             _ => self.highlight(None),
@@ -1190,6 +1269,9 @@ impl State {
     }
 
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
+        if self.moving.is_some() {
+            return self.handle_move_key(key);
+        }
         if self.renaming.is_some() {
             return self.handle_rename_key(key);
         }
@@ -1263,6 +1345,7 @@ impl State {
             BareKey::Char('-') => self.change_width(false),
             BareKey::Char('=') | BareKey::Char('+') => self.change_width(true),
             BareKey::Char('0') => self.toggle_collapse(),
+            BareKey::Char('m') | BareKey::Char('ь') => self.start_move(),
             BareKey::Char('v') | BareKey::Char('м') => {
                 self.toggle_view();
                 true
@@ -1293,6 +1376,45 @@ impl State {
             }
             _ => false,
         }
+    }
+
+    /// Pick the tab under the selection (a pane row: its tab) for moving.
+    fn start_move(&mut self) -> bool {
+        let position = match self.build_rows().get(self.selected) {
+            Some(Row::Tab { position, .. }) => Some(*position),
+            Some(Row::Pane { id, .. }) => self.pane_tab.get(id).copied(),
+            _ => None,
+        };
+        let Some(t) = position.and_then(|p| self.tabs.iter().find(|t| t.position == p)) else {
+            return false;
+        };
+        self.moving = Some((t.tab_id, parse_attention(&t.name).1.to_string()));
+        true
+    }
+
+    /// Digit: move the tab to that session; Esc or anything else: cancel.
+    fn handle_move_key(&mut self, key: KeyWithModifier) -> bool {
+        let Some((tab_id, _)) = self.moving.take() else { return false };
+        let BareKey::Char(c) = key.bare_key else { return true };
+        let Some(target) = c
+            .to_digit(10)
+            .and_then(|d| (d as usize).checked_sub(1))
+            .and_then(|i| self.sessions.get(i))
+        else {
+            return true;
+        };
+        let Some(session) = self.session.clone() else { return true };
+        // Detached: the script closes this tab, and this instance with it.
+        let line = format!(
+            "setsid {} {} {} {} >/tmp/zellij-move-tab.log 2>&1 &",
+            self.move_command,
+            sh_quote(&session),
+            tab_id,
+            sh_quote(target)
+        );
+        run_command(&["sh", "-c", &line], BTreeMap::new());
+        self.keys_off(true);
+        true
     }
 
     /// Resize step in columns: observed, else Zellij's 5% of the tab width.
@@ -1438,6 +1560,7 @@ impl State {
                 self.keys_on_here(Some(tab));
             }
             self.highlight(pane);
+            self.expand_if_stacked(pane);
         } else {
             // the clicked tab is where Esc returns to
             self.keys_origin = Some(tab);
@@ -1497,6 +1620,14 @@ impl ZellijPlugin for State {
             .get("completed_icon")
             .cloned()
             .unwrap_or_else(|| "✓".to_string());
+        self.shell_icon = configuration
+            .get("shell_icon")
+            .cloned()
+            .unwrap_or_else(|| "$".to_string());
+        self.monitor_icon = configuration
+            .get("monitor_icon")
+            .cloned()
+            .unwrap_or_else(|| "◉".to_string());
         self.autogroup_default = match configuration
             .get("autogroup_default")
             .map(String::as_str)
@@ -1508,6 +1639,10 @@ impl ZellijPlugin for State {
         self.autogroup_rules = parse_autogroup_rules(&configuration);
         self.spinner = parse_spinner(configuration.get("spinner"));
         self.pinned = configuration.get("pinned").map(String::as_str) != Some("false");
+        self.move_command = configuration
+            .get("move_tab_command")
+            .cloned()
+            .unwrap_or_else(|| "zellij-move-tab".to_string());
         self.show_single_pane =
             configuration.get("show_single_pane").map(String::as_str) == Some("true");
         // the state file's saved view, once loaded, wins over this default
@@ -1520,6 +1655,8 @@ impl ZellijPlugin for State {
             PermissionType::ReadCliPipes,
             // keyboard-mode hand-over between the per-tab instances (vtabs-take-keys)
             PermissionType::MessageAndLaunchOtherPlugins,
+            // moving a tab to another session runs the zellij-move-tab script
+            PermissionType::RunCommands,
         ]);
         subscribe(&[
             EventType::ModeUpdate,
@@ -1529,6 +1666,7 @@ impl ZellijPlugin for State {
             EventType::Mouse,
             EventType::Timer,
             EventType::PermissionRequestResult,
+            EventType::SessionUpdate,
         ]);
         self.ensure_timer();
     }
@@ -1542,6 +1680,16 @@ impl ZellijPlugin for State {
                     set_selectable(false);
                 }
                 false
+            }
+            Event::SessionUpdate(sessions, _) => {
+                let others: Vec<String> = sessions
+                    .into_iter()
+                    .filter(|s| !s.is_current_session)
+                    .map(|s| s.name)
+                    .collect();
+                let changed = others != self.sessions;
+                self.sessions = others;
+                changed && self.moving.is_some()
             }
             Event::ModeUpdate(mode_info) => {
                 if mode_info.session_name != self.session {
@@ -1564,6 +1712,8 @@ impl ZellijPlugin for State {
                 {
                     self.focus_on_show = false;
                     self.keys_on_here(self.keys_origin);
+                    let h = self.highlighted;
+                    self.expand_if_stacked(h);
                 }
                 // No clear on focus (local change): markers are session state,
                 // ended only by the next signal.
@@ -1629,6 +1779,13 @@ impl ZellijPlugin for State {
                 self.sidebar_by_tab.clear();
                 self.tab_panes.clear();
                 self.plugin_tab.clear();
+                self.stacked_collapsed = manifest
+                    .panes
+                    .values()
+                    .flatten()
+                    .filter(|p| !p.is_plugin && p.is_suppressed)
+                    .map(|p| p.id)
+                    .collect();
                 for (tab_pos, panes) in &manifest.panes {
                     let mut list: Vec<_> = panes
                         .iter()
@@ -1753,7 +1910,11 @@ impl ZellijPlugin for State {
             if !self.keys_on {
                 // a hidden instance may not have read the view switched elsewhere
                 self.load_state();
-                let (origin, pane) = pipe_message.payload.as_deref().unwrap_or("").split_once(':').unwrap_or(("", ""));
+                let mut parts = pipe_message.payload.as_deref().unwrap_or("").split(':');
+                let (origin, pane) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                if self.my_tab.is_none() {
+                    self.my_tab = parts.next().and_then(|t| t.parse().ok());
+                }
                 // select before switching: this tab shows with the row already chosen
                 if let Ok(id) = pane.parse::<u32>() {
                     self.pending_pane = Some(id);
@@ -1779,6 +1940,17 @@ impl ZellijPlugin for State {
             if parts.len() == 2 {
                 if let Ok(pane_id) = parts[1].parse::<u32>() {
                     let payload = pipe_message.payload.as_deref().unwrap_or("");
+                    if parts[0] == "background" {
+                        // a CLI pipe with a payload is followed by an empty message
+                        // (end of input): not a "0 0"
+                        if payload.trim().is_empty() {
+                            return false;
+                        }
+                        return self.set_pane_background(pane_id, payload);
+                    }
+                    if parts[0] == "clear-working" {
+                        self.pane_background.remove(&pane_id);
+                    }
                     // the status view regroups rows on a state change — keep the
                     // selection on the same row, not the same index
                     let keep = self.selected_key();
@@ -1866,12 +2038,13 @@ impl ZellijPlugin for State {
                         if let Some(buf) = editing {
                             format!("  {} {}▏", dot, buf)
                         } else {
-                            format!("  {} {}{}", dot, self.icon_slot(*attention), label)
+                            let slot = self.state_slot(*attention, self.tab_background(*position));
+                            format!("  {} {}{}", dot, slot, label)
                         }
                     }
-                    Row::Pane { title, focused, last, flat, attention, .. } => {
+                    Row::Pane { id, title, focused, last, flat, attention } => {
                         let branch = if *last { "└" } else { "├" };
-                        let icon = self.icon_slot(*attention);
+                        let icon = self.state_slot(*attention, self.background_of([id]));
                         let title = strip_claude_glyph(title);
                         if *flat {
                             let dot = if *focused { "●" } else { " " };
@@ -1893,6 +2066,8 @@ impl ZellijPlugin for State {
                 } else {
                     line
                 };
+                // no dim inside the bar: dim on reverse video reads as shaded letters
+                let bar = bar.replace("\u{1b}[2m", "").replace("\u{1b}[22m", "");
                 out.push_str(&format!("\u{1b}[7m{}\u{1b}[0m", bar));
             } else {
                 // truncation can cut off a closing escape (a dimmed tail) —
@@ -1902,8 +2077,27 @@ impl ZellijPlugin for State {
             }
             out.push_str("\r\n");
         }
+        if let Some((_, name)) = &self.moving {
+            let mut menu = vec![String::new(), format!("Move \u{1b}[1m{}\u{1b}[22m to:", name)];
+            if self.sessions.is_empty() {
+                menu.push("\u{1b}[2m(no other session)\u{1b}[22m".to_string());
+            }
+            for (i, s) in self.sessions.iter().take(9).enumerate() {
+                menu.push(format!(" {} {}", i + 1, s));
+            }
+            menu.push("\u{1b}[2mdigit: move, Esc: cancel\u{1b}[22m".to_string());
+            for l in menu {
+                out.push_str(&truncate_visible(&format!("{}{}", pad, l), cols));
+                out.push_str("\u{1b}[0m\r\n");
+            }
+        }
         print!("{}", out);
     }
+}
+
+/// Single-quote a string for `sh -c` (local change: session names in the move command).
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Pane title for the 28-column sidebar: drop the shell's `user@host: ` prefix
@@ -2209,6 +2403,30 @@ mod tests {
         let default: Vec<String> = SPINNER_DEFAULT.chars().map(String::from).collect();
         assert_eq!(parse_spinner(None), default);
         assert_eq!(parse_spinner(Some(&"  ".to_string())), default); // whitespace-only
+    }
+
+    #[test]
+    fn background_column_shows_shells_and_monitors() {
+        let mut s = State {
+            shell_icon: "$".into(),
+            monitor_icon: "@".into(),
+            tab_panes: [(0, vec![(1, "a".to_string(), false), (2, "b".to_string(), false)])].into(),
+            ..Default::default()
+        };
+        // the cells are reserved even with no background work
+        assert_eq!(s.background_slot((0, 0)), "  ");
+        assert!(s.set_pane_background(1, "2 0"));
+        assert!(!s.set_pane_background(1, "2 0"));
+        assert!(s.set_pane_background(2, "0 1"));
+        let plain = |x: String| x.replace("\u{1b}[35m", "").replace("\u{1b}[34m", "").replace("\u{1b}[39m", "");
+        assert_eq!(plain(s.background_slot(s.background_of([&1]))), "$ ");
+        assert_eq!(plain(s.background_slot(s.background_of([&2]))), " @");
+        assert_eq!(plain(s.background_slot(s.tab_background(0))), "$@");
+        assert_eq!(plain(s.state_slot(None, s.tab_background(0))), " $@ ");
+        assert!(s.set_pane_background(1, "0 0"));
+        assert!(s.set_pane_background(2, "0 0"));
+        assert_eq!(s.tab_background(0), (0, 0));
+        assert_eq!(s.state_slot(None, (0, 0)), "    ");
     }
 
     #[test]

@@ -11,11 +11,14 @@ A vertical, grouped, collapsible tab sidebar for [Zellij](https://zellij.dev) �
 - **State markers as prefixes** (`⚙ name` instead of `name ⚙`); old suffix markers are still recognized.
 - **Keyboard mode** (`MessagePlugin … { name "vtabs-focus"; }`, e.g. bound to `Alt+w`): arrows / `j` `k` browse tabs with a live preview and step onto pane rows (the pane frame is highlighted), Enter stays/focuses, Esc returns. Needs the `MessageAndLaunchOtherPlugins` permission for the hand-over between per-tab instances.
 - **Status view** (`v` in keyboard mode, `м` on a Russian layout; `default_view "status"` to start in it): every session (terminal pane) listed under Waiting / Working / Done / Idle, most urgent first, labelled with its title and its tab. The choice is saved, so every tab's sidebar shows the same view; reordering is done in the project view.
+- **Background-work column**: a finished turn (`✓`) that still has shell commands running in the background or monitors armed reads apart from an idle one: `$` (shells) and `◉` (monitors) after the state icon, summed over a tab's panes. `shell/vtabs-bg.sh` (started by `vtabs-work.sh`, one per pane) finds them among the Claude process's children every 2 s and sends `zellij-vtabs::background::<pane>` with the payload `"<shells> <monitors>"`. While a turn runs, its own foreground command counts as a shell too. The two cells are always reserved, so names never shift when work starts or ends.
 - **Tab state rolls up its panes**: a tab with several sessions shows the most urgent pane state (waiting > working > done), not the last signal.
 - **Click enters keyboard mode**: a click on a tab or pane row shows that tab (a pane's frame is highlighted) and keeps the keys in the sidebar, so the arrows go on from there; Enter focuses, Esc stays in that tab. A click on a group header still folds it.
 - **Width and collapse** (keyboard mode, the same keys on any keyboard layout): `-` narrower, `=` wider, `0` collapses the sidebar to its narrowest, drawing only state icons, and expands it back. The width is saved and every tab's sidebar keeps to it, also after a swap layout resets pane sizes. Needs the sidebar's `size` in the layout as a percentage (e.g. `size="15%"`): Zellij does not resize a fixed-size pane. Zellij resizes in steps of 5% of the tab, so the width lands on the nearest step.
 - **Selection follows focus**: the highlighted row is the focused pane's row when the active tab lists its panes, also after Alt+arrows and clicks.
 - **Pinned sidebar** (`pinned`, on by default): focus never lands on the sidebar by accident; `pinned "false"` restores upstream behavior.
+- **Move a tab to another session** (`m` in keyboard mode, `ь` on a Russian layout, then the session's digit): Zellij cannot hand live processes between session servers, so `shell/zellij-move-tab` (on `PATH`, or set `move_tab_command`) cuts the tab out of `dump-layout`, closes it in the source and opens the layout as a new tab in the target. Claude panes started through the claude-zellij wrapper come back in the same conversation through the resurrection hook; shells keep only their working directory. If the target refuses the layout, the tab is reopened in the source. `zellij-move-tab <from> <tab-id> <to> --dry-run` prints the layout. Needs the `RunCommands` permission; the log is `/tmp/zellij-move-tab.log`.
+- **Collapsed stacked panes**: choosing one in keyboard mode expands it in its stack.
 - **Auto-named one-pane tabs** follow their pane title (for a command line just the program name) until renamed by hand.
 - **Auto-close**: a tab where only the sidebar is left (the terminal exited) closes itself.
 
@@ -162,7 +165,7 @@ right signal — so the spinner stays lit for the *whole* task, not just the mai
 first turn. Install it and wire the hooks:
 
 ```bash
-cp shell/vtabs-work.sh ~/.config/zellij/vtabs-work.sh && chmod +x ~/.config/zellij/vtabs-work.sh
+cp shell/vtabs-work.sh shell/vtabs-bg.sh ~/.config/zellij/ && chmod +x ~/.config/zellij/vtabs-work.sh ~/.config/zellij/vtabs-bg.sh
 ```
 
 ```json
@@ -199,6 +202,8 @@ cp shell/vtabs-work.sh ~/.config/zellij/vtabs-work.sh && chmod +x ~/.config/zell
   subagents are still working
 - `SessionEnd` (Claude exits) → clears any leftover spinner and the pane's count
 - `PostToolUse` → after a `Notification` pause (e.g. an answered permission prompt) the next tool call relights the spinner once; otherwise it sends nothing, so it is cheap on every tool call
+- `SubagentStop` with nothing outstanding and the turn over sends nothing: Claude Code also fires it for its internal agents, with no `SubagentStart` and often after `Stop`, which used to relight the spinner for good
+- `PostToolUse`, `Stop`, `UserPromptSubmit` also start the pane's background-work watcher (`vtabs-bg.sh`, next to `vtabs-work.sh`) if it is not running
 - `PreCompact` / `PostCompact` (manual `/compact`) → spinner while compacting, `✓` when done
 - Focusing the tab clears `◆`/`✓`; the spinner survives focus and ends via the hooks above
 
@@ -325,6 +330,8 @@ plugin location="file:~/.config/zellij/plugins/zellij-vtabs.wasm" {
     separator ":"          // tab-name group separator
     waiting_icon "◆"       // rendered yellow
     completed_icon "✓"     // rendered green
+    shell_icon "$"         // background shell commands, rendered magenta
+    monitor_icon "◉"       // armed monitors, rendered blue
     spinner "⣾⣽⣻⢿⡿⣟⣯⣷"    // working animation: each char = one frame
     // plus the autogroup_* keys described above
 }

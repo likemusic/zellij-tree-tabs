@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Move a Zellij tab to another running session.
+
+Usage: zellij-move-tab <from-session> <tab-id> <to-session> [--dry-run]
+
+Zellij cannot hand live processes from one session server to another, so the
+tab is re-created: its layout is cut out of `dump-layout`, the tab is closed in
+the source session (its programs exit — Claude saves the conversation), and the
+layout is opened as a new tab in the target session. Claude panes started
+through the zellij-claude-enhance wrapper come back in the same conversation:
+their command is rewritten by the resurrection hook to `claude-zellij
+--zellij-marker <marker>`, which resumes the conversation stored for that
+marker. Shells keep only their working directory.
+
+--dry-run prints the layout that would be opened and changes nothing.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+HOOK = os.path.expanduser("~/.local/bin/zellij-resurrect-hook.sh")
+# state markers the sidebar prefixes tab names with
+MARKERS = ("⏳ ", "✅ ", "⚙ ")
+
+
+def zellij(session, *args, check=True):
+    return subprocess.run(
+        ["zellij", "-s", session, "action", *args],
+        capture_output=True, text=True, check=check,
+    )
+
+
+def blocks(text):
+    """Top-level children of `layout { ... }` as (header line, body lines)."""
+    lines = text.splitlines()
+    out, depth, cur = [], 0, None
+    for line in lines:
+        s = line.strip()
+        if depth == 1 and cur is None and s:
+            cur = [line]
+            if s.endswith("{"):
+                depth += 1
+            else:
+                out.append(cur)
+                cur = None
+            continue
+        if cur is not None:
+            cur.append(line)
+        depth += s.count("{") - s.count("}")
+        if cur is not None and depth == 1:
+            out.append(cur)
+            cur = None
+    return out
+
+
+def root_cwd(text):
+    m = re.search(r'^\s*cwd "([^"]*)"', text, re.M)
+    return m.group(1) if m else os.path.expanduser("~")
+
+
+def kdl_strings(s):
+    return [json.loads(x) for x in re.findall(r'"(?:[^"\\]|\\.)*"', s)]
+
+
+def rewrite_command(command, args):
+    """The command line the resurrection hook would restart this pane with."""
+    if not os.access(HOOK, os.X_OK):
+        return command, args
+    line = " ".join([command, *args])
+    env = dict(os.environ, RESURRECT_COMMAND=line)
+    r = subprocess.run([HOOK], capture_output=True, text=True, env=env)
+    words = shlex.split(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else []
+    return (words[0], words[1:]) if words else (command, args)
+
+
+def absolute_cwds(body, base):
+    def fix(m):
+        cwd = m.group(1)
+        if not cwd.startswith("/"):
+            cwd = os.path.join(base, cwd)
+        return 'cwd=%s' % json.dumps(cwd, ensure_ascii=False)
+    return [re.sub(r'cwd="([^"]*)"', fix, l) for l in body]
+
+
+def rewrite_commands(body):
+    """Rewrite each `pane command=... { args ... }` through the hook; a moved
+    pane runs at once (a resurrected one would wait for Enter)."""
+    out, i = [], 0
+    while i < len(body):
+        line = body[i]
+        m = re.search(r'command="((?:[^"\\]|\\.)*)"', line)
+        if not m:
+            out.append(line)
+            i += 1
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        opens = line.rstrip().endswith("{")
+        end, args, children = i, [], []
+        if opens:
+            depth, end = 1, i + 1
+            while depth > 0:
+                s = body[end].strip()
+                if depth == 1 and s.startswith("args "):
+                    args = kdl_strings(s[5:])
+                elif depth == 1 and s.startswith("start_suspended"):
+                    pass
+                elif depth > 1 or s != "}":
+                    children.append(body[end])
+                depth += s.count("{") - s.count("}")
+                end += 1
+            end -= 1  # the pane's closing brace
+        command, args = rewrite_command(json.loads('"%s"' % m.group(1)), args)
+        head = line.replace(m.group(0), "command=" + json.dumps(command, ensure_ascii=False))
+        head = re.sub(r"\s*start_suspended=(true|false)", "", head).rstrip()
+        if not head.endswith("{"):
+            head += " {"
+        out.append(head)
+        if args:
+            out.append(indent + "    args " + " ".join(json.dumps(a, ensure_ascii=False) for a in args))
+        out.extend(children)
+        out.append(indent + "}")
+        i = end + 1
+    return out
+
+
+def main():
+    argv = [a for a in sys.argv[1:] if a != "--dry-run"]
+    dry = "--dry-run" in sys.argv
+    if len(argv) != 3:
+        sys.exit(__doc__.strip().splitlines()[2])
+    src, tab_id, dst = argv[0], int(argv[1]), argv[2]
+    if src == dst:
+        sys.exit("source and target session are the same")
+
+    tabs = json.loads(zellij(src, "list-tabs", "--json").stdout)
+    tab = next((t for t in tabs if t["tab_id"] == tab_id), None)
+    if tab is None:
+        sys.exit("no tab with id %d in session %s" % (tab_id, src))
+    dump = zellij(src, "dump-layout").stdout
+    tab_blocks = [b for b in blocks(dump) if b[0].strip().startswith("tab")]
+    if tab["position"] >= len(tab_blocks):
+        sys.exit("tab %d not found in the dumped layout" % tab_id)
+    block = tab_blocks[tab["position"]]
+
+    name = tab["name"]
+    for m in MARKERS:
+        if name.startswith(m):
+            name = name[len(m):]
+    head = block[0]
+    base = root_cwd(dump)
+    tab_cwd = re.search(r'cwd="([^"]*)"', head)
+    if tab_cwd:
+        base = tab_cwd.group(1) if tab_cwd.group(1).startswith("/") else os.path.join(base, tab_cwd.group(1))
+    body = rewrite_commands(absolute_cwds(block[1:-1], base))
+    # focus on a plugin pane is the sidebar's keyboard mode: not worth keeping
+    body = [
+        re.sub(r"\s*focus=true", "", l) if k + 1 < len(body) and "plugin location=" in body[k + 1] else l
+        for k, l in enumerate(body)
+    ]
+    layout = "layout {\n    cwd %s\n%s\n}\n" % (json.dumps(base, ensure_ascii=False), "\n".join(body))
+
+    if dry:
+        print("# tab %r -> session %s" % (name, dst))
+        print(layout)
+        return
+
+    # target must be a running session: a new tab can't be added to an exited one
+    zellij(dst, "list-tabs", "--json")
+    # close first: the same conversation must not run in two Claude processes
+    zellij(src, "close-tab-by-id", str(tab_id))
+    time.sleep(1.5)
+    r = zellij(dst, "new-tab", "--name", name, "--layout-string", layout, check=False)
+    if r.returncode != 0:
+        # put it back where it was rather than lose the layout
+        zellij(src, "new-tab", "--name", tab["name"], "--layout-string", layout, check=False)
+        sys.exit("could not open the tab in %s: %s" % (dst, r.stderr.strip()))
+    print("moved %r to %s" % (name, dst))
+
+
+if __name__ == "__main__":
+    main()
