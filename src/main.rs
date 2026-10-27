@@ -3381,6 +3381,15 @@ impl State {
                 return false;
             }
             "vtabs-hello" => return false,
+            // `zellij pipe --plugin <url> --name vtabs-reload-brain`: start-or-reload-plugin
+            // reloads only plugins in panes, not the background brain
+            "vtabs-reload-brain" => {
+                if let (Role::Screen, false, Some(id)) = (self.role, self.hidden, self.brain_id) {
+                    vlog!("reload brain {} from screen {}", id, self.my_id);
+                    reload_plugin_with_id(id);
+                }
+                return false;
+            }
             // `zellij pipe --name vtabs-start-brain`: a session started before
             // the brain was in load_plugins gets one from its visible sidebar
             "vtabs-start-brain" => {

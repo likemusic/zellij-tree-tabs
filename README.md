@@ -420,7 +420,7 @@ load_plugins {
 }
 ```
 
-A session started before that entry gets its brain from the visible sidebar: `zellij pipe --name vtabs-start-brain`. Two brains (that pipe plus `load_plugins`) find each other: the newer one closes itself. To reload the brain after a rebuild: `zellij action start-or-reload-plugin -c role=brain file:…/zellij-vtabs.wasm` (the screens: the same without `-c`).
+A session started before that entry gets its brain from the visible sidebar: `zellij pipe --name vtabs-start-brain`. Two brains (that pipe plus `load_plugins`) find each other: the newer one closes itself. After a rebuild, reload the screens with `zellij action start-or-reload-plugin file:…/zellij-vtabs.wasm`, then the brain with `zellij pipe --plugin file:…/zellij-vtabs.wasm --name vtabs-reload-brain`: start-or-reload-plugin reloads only plugins in panes, so the visible screen reloads the background brain by its id. `shell/vtabs-reload` does both.
 
 
 The one non-obvious design decision, learned the hard way:
