@@ -1174,8 +1174,8 @@ impl State {
                 }
                 if let Some(main) = main {
                     let before = rows.len();
-                    // depth + 2 puts the header's ▶ right of the panes' └ (see render)
-                    self.push_worktree_rows(&mut rows, &node.path, &main, node.depth + 2);
+                    // depth + 3 puts the header's ▶ right of the panes' └ (see render)
+                    self.push_worktree_rows(&mut rows, &node.path, &main, node.depth + 3);
                     // the header continues the tab's pane tree: its last pane is no longer last
                     if rows.len() > before {
                         if let Some(Row::Pane { last, .. }) = rows[..before].last_mut() {
@@ -3444,8 +3444,8 @@ impl State {
                             format!("{}{} {}", indent, disc, with_cursor(buf, self.rename_back))
                         } else if name.contains('⎇') {
                             // last branch of the tab's pane tree, ▶/▼ still at 2 * depth
-                            let indent = "  ".repeat(depth.saturating_sub(2));
-                            format!("{}  \u{1b}[2m└\u{1b}[22m {} {} ({})", indent, disc, label, count)
+                            let indent = "  ".repeat(depth.saturating_sub(3));
+                            format!("{}    \u{1b}[2m└\u{1b}[22m {} {} ({})", indent, disc, label, count)
                         } else {
                             let icon = if *collapsed { self.icon(*attention, *unread) } else { String::new() };
                             let bell = if *collapsed && self.group_has_bell(name) { BELL_MARK } else { "" };
@@ -3478,9 +3478,10 @@ impl State {
                             let dot = if *focused { "●" } else { " " };
                             format!("  {} {}{}", dot, icon, title)
                         } else if *focused {
-                            format!("{}  {} {}{}", indent, branch, icon, title)
+                            // the branch under the tab's state icon: titles start right of the tab's label
+                            format!("{}    {} {}{}", indent, branch, icon, title)
                         } else {
-                            format!("{}  \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", indent, branch, icon, title)
+                            format!("{}    \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", indent, branch, icon, title)
                         }
                     }
                 }
