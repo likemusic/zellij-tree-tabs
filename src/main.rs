@@ -565,6 +565,10 @@ struct State {
     /// per-pane state from the same pipes as the tab markers (local change), kept
     /// in memory: every instance gets every pipe, so each holds the full map
     pane_attention: BTreeMap<u32, Attention>,
+    /// panes whose session finished its turn (or asked) while you were
+    /// elsewhere (local change), until you focus them — Zellij's `[!]`, kept
+    /// per pane: their ✓ is drawn bright, a read one dim
+    pane_unread: BTreeSet<u32>,
     /// per-pane background work of its Claude session (local change, from
     /// vtabs-bg.sh): shell commands and monitors still running, so a finished
     /// turn that waits on them reads apart from an idle one
@@ -662,12 +666,12 @@ struct TabItem {
 enum Row {
     /// `name`: the group's path (`a/b`, collapse and order key); `label`: what is
     /// shown (a chain of single-subgroup groups is one row); `depth`: nesting
-    Group { name: String, label: String, depth: usize, collapsed: bool, count: usize, attention: Option<Attention> },
-    Tab { position: usize, label: String, depth: usize, active: bool, attention: Option<Attention> },
+    Group { name: String, label: String, depth: usize, collapsed: bool, count: usize, attention: Option<Attention>, unread: bool },
+    Tab { position: usize, label: String, depth: usize, active: bool, attention: Option<Attention>, unread: bool },
     /// a terminal pane of the tab above, listed when the tab has 2+ panes;
     /// keyboard mode browses onto it (frame highlighted), Enter/click focuses it
     /// `flat`: a session row of the status view — no tree branch, tab-row indent
-    Pane { id: u32, title: String, depth: usize, focused: bool, last: bool, flat: bool, attention: Option<Attention> },
+    Pane { id: u32, title: String, depth: usize, focused: bool, last: bool, flat: bool, attention: Option<Attention>, unread: bool },
 }
 
 impl State {
@@ -859,6 +863,7 @@ impl State {
                         id: *id,
                         title,
                         depth: 0,
+                        unread: self.pane_unread.contains(id),
                         focused: *focused && it.active,
                         last: false,
                         flat: true,
@@ -877,6 +882,7 @@ impl State {
                 Row::Pane { attention: Some(x), .. } => Some(merge(acc, *x)),
                 _ => acc,
             });
+            let unread = items.iter().any(|r| matches!(r, Row::Pane { unread: true, .. }));
             rows.push(Row::Group {
                 name: name.to_string(),
                 label: name.to_string(),
@@ -884,6 +890,7 @@ impl State {
                 collapsed,
                 count: items.len(),
                 attention,
+                unread,
             });
             if !collapsed {
                 rows.extend(items);
@@ -915,6 +922,11 @@ impl State {
                     (n + 1, it.attention.map_or(acc, |x| Some(merge(acc, x))))
                 });
             let collapsed = self.collapsed.contains(&node.path);
+            let unread = items
+                .iter()
+                .filter(|(g, _)| in_subtree(g))
+                .flat_map(|(_, its)| its)
+                .any(|it| self.any_unread(self.tab_panes.get(&it.position).into_iter().flatten().map(|(id, _, _)| id)));
             rows.push(Row::Group {
                 name: node.path.clone(),
                 label: node.label,
@@ -922,6 +934,7 @@ impl State {
                 collapsed,
                 count,
                 attention: group_att,
+                unread,
             });
             if collapsed {
                 skip_below = Some(node.depth);
@@ -935,6 +948,7 @@ impl State {
                     depth: node.depth,
                     active: it.active,
                     attention: it.attention,
+                    unread: self.any_unread(panes.into_iter().flatten().map(|(id, _, _)| id)),
                 });
                 if let Some(panes) = panes.filter(|p| p.len() > 1 || self.show_single_pane && !p.is_empty()) {
                     for (i, (id, title, focused)) in panes.iter().enumerate() {
@@ -946,6 +960,7 @@ impl State {
                             last: i + 1 == panes.len(),
                             flat: false,
                             attention: self.pane_attention.get(id).copied(),
+                            unread: self.pane_unread.contains(id),
                         });
                     }
                 }
@@ -971,8 +986,14 @@ impl State {
         Some(pane.map_or(tab, |i| tab + 1 + i))
     }
 
-    fn icon(&self, att: Option<Attention>) -> String {
+    /// A finished session's ✓ (local change): bright and bold while unread,
+    /// dim once you have been in the pane.
+    fn icon(&self, att: Option<Attention>, unread: bool) -> String {
         match att {
+            Some(Attention::Completed) if unread => {
+                format!("\u{1b}[1;92m{}\u{1b}[22;39m ", self.completed_icon)
+            }
+            Some(Attention::Completed) => format!("\u{1b}[2m\u{1b}[32m{}\u{1b}[39m\u{1b}[22m ", self.completed_icon),
             Some(Attention::Waiting) => format!("\u{1b}[33m{}\u{1b}[39m ", self.waiting_icon),
             Some(Attention::Working) => {
                 let frame = self
@@ -982,15 +1003,14 @@ impl State {
                     .unwrap_or("⣾");
                 format!("\u{1b}[36m{}\u{1b}[39m ", frame)
             }
-            Some(Attention::Completed) => format!("\u{1b}[32m{}\u{1b}[39m ", self.completed_icon),
             None => String::new(),
         }
     }
 
     /// The icon in a fixed 2-column slot (local change), so names start in the
     /// same column whether or not a row has a state icon.
-    fn icon_slot(&self, att: Option<Attention>) -> String {
-        if att.is_some() { self.icon(att) } else { "  ".to_string() }
+    fn icon_slot(&self, att: Option<Attention>, unread: bool) -> String {
+        if att.is_some() { self.icon(att, unread) } else { "  ".to_string() }
     }
 
     /// Background work of panes (local change): shells and monitors summed.
@@ -1016,8 +1036,8 @@ impl State {
     }
 
     /// State icon and background cells in one fixed 4-column slot (local change).
-    fn state_slot(&self, att: Option<Attention>, bg: (u16, u16)) -> String {
-        let glyph = if att.is_some() { self.icon(att).trim_end().to_string() } else { " ".to_string() };
+    fn state_slot(&self, att: Option<Attention>, unread: bool, bg: (u16, u16)) -> String {
+        let glyph = if att.is_some() { self.icon(att, unread).trim_end().to_string() } else { " ".to_string() };
         format!("{}{} ", glyph, self.background_slot(bg))
     }
 
@@ -1197,13 +1217,31 @@ impl State {
         new != old
     }
 
+    /// The pane you are in is read (local change): drop its unread mark. One
+    /// host call, only while something is unread. True if it changed.
+    fn mark_focused_read(&mut self) -> bool {
+        if self.pane_unread.is_empty() {
+            return false;
+        }
+        match get_focused_pane_info() {
+            Ok((_, PaneId::Terminal(f))) => self.pane_unread.remove(&f),
+            _ => false,
+        }
+    }
+
+    /// Whether any of `panes` is unread.
+    fn any_unread<'a>(&self, panes: impl IntoIterator<Item = &'a u32>) -> bool {
+        panes.into_iter().any(|id| self.pane_unread.contains(id))
+    }
+
     /// Forget the marks of a closed pane (local change: on PaneClosed, not on
     /// every PaneUpdate — a pane briefly missing from one, e.g. while a stack
     /// expands, lost its mark until the next signal). True if anything changed.
     fn forget_pane(&mut self, id: u32) -> bool {
         let a = self.pane_attention.remove(&id).is_some();
         let b = self.pane_background.remove(&id).is_some();
-        a || b
+        let c = self.pane_unread.remove(&id);
+        a || b || c
     }
 
     /// The session ended (SessionEnd): strip whatever marker the tab has.
@@ -2108,6 +2146,7 @@ impl ZellijPlugin for State {
             }
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
+                self.mark_focused_read();
                 // Pick up order/collapse changes written by other instances —
                 // every tab switch fires a TabUpdate, so the visible sidebar
                 // is always freshly synced.
@@ -2300,6 +2339,7 @@ impl ZellijPlugin for State {
                     }
                 }
                 self.sync_width(false);
+                let read = self.mark_focused_read();
                 // Outside keyboard mode the bar follows pane focus (Alt+arrows, clicks,
                 // Enter on a pane row) — TabUpdate does not fire for a pane-only change.
                 if !self.keys_on && self.pending_pane.is_none() {
@@ -2309,6 +2349,9 @@ impl ZellijPlugin for State {
                             return true;
                         }
                     }
+                }
+                if read && !self.keys_on {
+                    return true;
                 }
                 if self.keys_on {
                     // plugin ids are unique per instance, so the pane alone identifies us
@@ -2439,7 +2482,20 @@ impl ZellijPlugin for State {
                     // the status view regroups rows on a state change — keep the
                     // selection on the same row, not the same index
                     let keep = self.selected_key();
-                    let pane_changed = self.set_pane_attention(pane_id, parts[0]);
+                    let mut pane_changed = self.set_pane_attention(pane_id, parts[0]);
+                    match parts[0] {
+                        "completed" | "waiting" => {
+                            let looking = matches!(get_focused_pane_info(), Ok((_, PaneId::Terminal(f))) if f == pane_id);
+                            if !looking {
+                                pane_changed |= self.pane_unread.insert(pane_id);
+                            }
+                        }
+                        // you answered (the session works again) or it ended
+                        "working" | "clear-working" => pane_changed |= self.pane_unread.remove(&pane_id),
+                        // marks restored from outside (after a plugin reload) are not news
+                        "read" => return self.pane_unread.remove(&pane_id),
+                        _ => {}
+                    }
                     if pane_changed {
                         self.reselect(keep);
                     }
@@ -2493,15 +2549,15 @@ impl ZellijPlugin for State {
         for (i, row) in visible.iter().enumerate() {
             let core = if narrow {
                 match row {
-                    Row::Group { collapsed: true, attention: Some(a), .. } => self.icon(Some(*a)),
+                    Row::Group { collapsed: true, attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
                     Row::Group { collapsed, .. } => (if *collapsed { "▶" } else { "▼" }).to_string(),
-                    Row::Tab { attention: Some(a), .. } => self.icon(Some(*a)),
+                    Row::Tab { attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
                     Row::Tab { active, .. } => (if *active { "●" } else { "·" }).to_string(),
-                    Row::Pane { attention, .. } => format!(" {}", self.icon_slot(*attention)),
+                    Row::Pane { attention, unread, .. } => format!(" {}", self.icon_slot(*attention, *unread)),
                 }
             } else {
                 match row {
-                    Row::Group { name, label, depth, collapsed, count, attention } => {
+                    Row::Group { name, label, depth, collapsed, count, attention, unread } => {
                         let indent = "  ".repeat(*depth);
                         let disc = if *collapsed { "▶" } else { "▼" };
                         let editing = match &self.renaming {
@@ -2511,11 +2567,11 @@ impl ZellijPlugin for State {
                         if let Some(buf) = editing {
                             format!("{}{} {}▏", indent, disc, buf)
                         } else {
-                            let icon = if *collapsed { self.icon(*attention) } else { String::new() };
+                            let icon = if *collapsed { self.icon(*attention, *unread) } else { String::new() };
                             format!("{}{} {}{} ({})", indent, disc, icon, label, count)
                         }
                     }
-                    Row::Tab { position, label, depth, active, attention } => {
+                    Row::Tab { position, label, depth, active, attention, unread } => {
                         let indent = "  ".repeat(*depth);
                         let dot = if *active { "●" } else { " " };
                         let editing = match &self.renaming {
@@ -2525,14 +2581,14 @@ impl ZellijPlugin for State {
                         if let Some(buf) = editing {
                             format!("{}  {} {}▏", indent, dot, buf)
                         } else {
-                            let slot = self.state_slot(*attention, self.tab_background(*position));
+                            let slot = self.state_slot(*attention, *unread, self.tab_background(*position));
                             format!("{}  {} {}{}", indent, dot, slot, label)
                         }
                     }
-                    Row::Pane { id, title, depth, focused, last, flat, attention } => {
+                    Row::Pane { id, title, depth, focused, last, flat, attention, unread } => {
                         let indent = "  ".repeat(*depth);
                         let branch = if *last { "└" } else { "├" };
-                        let icon = self.state_slot(*attention, self.background_of([id]));
+                        let icon = self.state_slot(*attention, *unread, self.background_of([id]));
                         let title = strip_claude_glyph(title);
                         if *flat {
                             let dot = if *focused { "●" } else { " " };
@@ -2966,11 +3022,11 @@ mod tests {
         assert_eq!(plain(s.background_slot(s.background_of([&1]))), "$ ");
         assert_eq!(plain(s.background_slot(s.background_of([&2]))), " @");
         assert_eq!(plain(s.background_slot(s.tab_background(0))), "$@");
-        assert_eq!(plain(s.state_slot(None, s.tab_background(0))), " $@ ");
+        assert_eq!(plain(s.state_slot(None, false, s.tab_background(0))), " $@ ");
         assert!(s.set_pane_background(1, "0 0"));
         assert!(s.set_pane_background(2, "0 0"));
         assert_eq!(s.tab_background(0), (0, 0));
-        assert_eq!(s.state_slot(None, (0, 0)), "    ");
+        assert_eq!(s.state_slot(None, false, (0, 0)), "    ");
     }
 
     #[test]

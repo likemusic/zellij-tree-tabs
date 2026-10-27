@@ -41,7 +41,10 @@ Zellij has no native vertical tabs. This plugin renders a left sidebar showing t
 ![zellij-vtabs sidebar](docs/screenshot.png)
 
 Groups (`▼`/`▶`) collapse and expand; `◆` (yellow) marks a tab needing input, `✓` (green) a
-finished one, and `●` marks the active tab.
+finished one, and `●` marks the active tab. A `✓` is bright and bold while unread — the
+session finished its turn (or asked something) while you were in another pane, like
+Zellij's `[!]` — and dim once you have been in that pane. A `zellij-vtabs::read::<pane_id>`
+pipe marks a pane read (used when restoring marks after a plugin reload).
 
 - **Grouping** — a tab named `group:label` goes under group **group** with label **label**;
   a tab with no `:` lands in **General**. (First `:` wins.)
