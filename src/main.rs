@@ -3016,6 +3016,21 @@ impl State {
 
     /// Attention signals: `zellij-vtabs::waiting|completed::<pane_id>` (broadcast CLI pipe).
     fn pipe_inner(&mut self, pipe_message: PipeMessage) -> bool {
+        // Alt+i / Alt+o (local change): move a row in the sidebar's own order —
+        // the selected one in keyboard mode, else the active tab's row
+        if pipe_message.name == "vtabs-move" {
+            if self.hidden {
+                return false;
+            }
+            if !self.keys_on {
+                match self.build_rows().iter().position(|r| matches!(r, Row::Tab { active: true, .. })) {
+                    Some(i) => self.selected = i,
+                    None => return false,
+                }
+            }
+            let delta = if pipe_message.payload.as_deref() == Some("up") { -1 } else { 1 };
+            return self.move_selected(delta);
+        }
         if pipe_message.name == "vtabs-focus" {
             // Every instance (one per tab) gets the message; only the one whose tab
             // holds the client's focused pane acts. Not self.tabs: hidden instances
@@ -3295,6 +3310,8 @@ impl State {
                 self.sent_frames.remove(&id);
                 self.push_frame(id);
             }
+            // every screen forwards the keybinding's message: take the active one's
+            "vtabs-move" if from != Some(self.my_id) => {}
             "vtabs-key" => {
                 if let Some(key) = decode_key(&payload) {
                     self.handle_key(key);

@@ -328,6 +328,15 @@ re-read on every tab switch and needs no layout change — a changed plugin bloc
 different plugin to Zellij, so key binds that message the old one would launch a new
 copy. Another tool can write the file too (e.g. a project tree kept elsewhere).
 
+### Moving rows without keyboard mode
+
+`vtabs-move` (payload `up` or `down`) moves the active tab's row one place in the sidebar's own order — the same as `⇧↑`/`⇧↓` in keyboard mode, where it moves the selected row (a group too). Bound to Alt+i / Alt+o here, in place of Zellij's `MoveTab`, which reorders the tab bar instead:
+
+```kdl
+bind "Alt i" { MessagePlugin "file:/home/you/.config/zellij/plugins/zellij-vtabs.wasm" { name "vtabs-move"; payload "up"; }; }
+bind "Alt o" { MessagePlugin "file:/home/you/.config/zellij/plugins/zellij-vtabs.wasm" { name "vtabs-move"; payload "down"; }; }
+```
+
 ### Bell mark
 
 A tab whose pane rang the bell while the tab was not shown gets Zellij's `[!]` after its label (and a folded group holding it, after its count) — the same mark as in Zellij's tab bar, from `TabInfo.has_bell_notification`; it goes when the tab is shown. Claude Code rings it when a turn ends.
