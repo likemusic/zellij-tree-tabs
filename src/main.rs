@@ -159,12 +159,13 @@ fn tab_fold_key(label: &str) -> String {
 }
 
 /// ▼/▶ before a tab's label when it has rows of its own (see `Row::Tab`);
-/// two blanks keep the labels of the others aligned.
+/// a dim · in the same column for the others, so every tab of a group starts
+/// at one column and the group's shape shows.
 fn fold_mark(fold: Option<bool>) -> &'static str {
     match fold {
         Some(true) => "▶ ",
         Some(false) => "▼ ",
-        None => "  ",
+        None => "\u{1b}[2m·\u{1b}[22m ",
     }
 }
 

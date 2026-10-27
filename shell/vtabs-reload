@@ -10,7 +10,14 @@ cp "$src" "$HOME/.config/zellij/plugins/" || exit 1
 timeout 30 zellij -s "$s" action start-or-reload-plugin "$url"
 sleep 2
 # the brain runs in the background: start-or-reload-plugin misses it, a screen reloads it by id
-timeout 30 zellij -s "$s" pipe --plugin "$url" --name vtabs-reload-brain </dev/null
+# right after their reload the screens may not know yet which one is visible: retry until the log shows it
+log=/tmp/zellij-$(id -u)/zellij-log/zellij.log
+n=$(grep -c "VTABS reload brain" "$log" 2>/dev/null)
+for _ in 1 2 3 4 5 6; do
+  timeout 30 zellij -s "$s" pipe --plugin "$url" --name vtabs-reload-brain </dev/null
+  sleep 2
+  [ "$(grep -c "VTABS reload brain" "$log" 2>/dev/null)" != "$n" ] && break
+done
 sleep 3
 for f in /run/user/$(id -u)/zellij-vtabs/pane-$s-*; do
   id=${f##*-}; case $id in *[!0-9]*) continue;; esac
