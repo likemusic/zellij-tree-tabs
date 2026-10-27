@@ -710,6 +710,94 @@ struct State {
     /// working directory per tab position: of its first pane that has one
     /// (refreshed with the titles, by the visible instance)
     tab_cwd: BTreeMap<usize, String>,
+    /// brain/screen split (local change, see `Role`)
+    role: Role,
+    /// a screen's brain; a screen without one works on its own (legacy)
+    brain_id: Option<u32>,
+    /// a screen's last frame from the brain
+    frame_text: String,
+    /// brain: every sidebar pane's (rows, cols), and the last frame sent to each
+    screen_size: BTreeMap<u32, (usize, usize)>,
+    sent_frames: BTreeMap<u32, String>,
+    /// brain: ids of tabs that have had a terminal, and those found empty since
+    /// (closed on the next timer tick unless a terminal shows up)
+    tabs_with_terminal: BTreeSet<usize>,
+    tabs_to_close: BTreeSet<usize>,
+    my_rows: usize,
+    /// this instance's own plugin id (a brain's `my_id` is the active screen's)
+    self_id: u32,
+}
+
+/// Local change. One instance of this plugin per tab (the layout's sidebar
+/// pane) used to hold all the state, but Zellij sends tab and pane updates only
+/// to the plugins of the active tab: the others went stale and had to be synced
+/// through files and hand-overs. Now one more instance, loaded headless with
+/// `role "brain"` (`load_plugins` in config.kdl), gets every update, keeps the
+/// state, and draws the frame each sidebar pane (a screen) shows; screens send
+/// it their keys and clicks. A screen with no brain works on its own (Legacy).
+#[derive(Default, PartialEq, Clone, Copy, Debug)]
+enum Role {
+    #[default]
+    Legacy,
+    Brain,
+    Screen,
+}
+
+/// A key as text for the screen -> brain pipe: modifiers, then `u<code point in hex>` or the key's name.
+fn encode_key(key: &KeyWithModifier) -> String {
+    let mut parts: Vec<String> = key.key_modifiers.iter().map(|m| format!("{:?}", m)).collect();
+    parts.push(match key.bare_key {
+        BareKey::Char(c) => format!("u{:x}", c as u32),
+        BareKey::F(n) => format!("f{}", n),
+        other => format!("{:?}", other),
+    });
+    parts.join(" ")
+}
+
+fn decode_key(s: &str) -> Option<KeyWithModifier> {
+    let mut parts: Vec<&str> = s.split(' ').collect();
+    let bare = parts.pop()?;
+    let bare_key = if let Some(c) = bare.strip_prefix('u').and_then(|h| u32::from_str_radix(h, 16).ok()).and_then(char::from_u32) {
+        BareKey::Char(c)
+    } else {
+        bare.parse::<BareKey>().ok()?
+    };
+    let mut key_modifiers = BTreeSet::new();
+    for m in parts {
+        key_modifiers.insert(match m {
+            "Shift" => KeyModifier::Shift,
+            "Alt" => KeyModifier::Alt,
+            "Ctrl" => KeyModifier::Ctrl,
+            "Super" => KeyModifier::Super,
+            "" => continue,
+            _ => return None,
+        });
+    }
+    Some(KeyWithModifier { bare_key, key_modifiers })
+}
+
+fn encode_mouse(m: &Mouse) -> Option<String> {
+    Some(match m {
+        Mouse::LeftClick(r, c) => format!("L {} {}", r, c),
+        Mouse::ScrollUp(n) => format!("U {}", n),
+        Mouse::ScrollDown(n) => format!("D {}", n),
+        _ => return None,
+    })
+}
+
+fn decode_mouse(s: &str) -> Option<Mouse> {
+    let f: Vec<&str> = s.split(' ').collect();
+    Some(match f.as_slice() {
+        ["L", r, c] => Mouse::LeftClick(r.parse().ok()?, c.parse().ok()?),
+        ["U", n] => Mouse::ScrollUp(n.parse().ok()?),
+        ["D", n] => Mouse::ScrollDown(n.parse().ok()?),
+        _ => return None,
+    })
+}
+
+/// A sidebar pane: this plugin in a pane (a brain has none).
+fn is_sidebar(p: &PaneInfo) -> bool {
+    p.is_plugin && p.plugin_url.as_deref().is_some_and(|u| u.ends_with("zellij-vtabs.wasm"))
 }
 
 enum RenameTarget {
@@ -1756,18 +1844,44 @@ impl State {
         }
     }
 
+    /// Make sidebar pane `id` selectable or not: a plugin can do it only to
+    /// its own pane, so the brain asks the screen — which then also focuses
+    /// itself: a focus sent from here could land before the pane is selectable.
+    fn set_sel(&self, id: u32, on: bool) {
+        if self.role == Role::Brain {
+            pipe_message_to_plugin(
+                MessageToPlugin::new("vtabs-cmd")
+                    .with_destination_plugin_id(id)
+                    .with_payload(if on { "selectable" } else { "pinned" }),
+            );
+        } else {
+            set_selectable(on);
+        }
+    }
+
     fn keys_on_here(&mut self, origin: Option<usize>) {
         vlog!("keys_on my_id={} my_tab={:?} origin={:?}", self.my_id, self.my_tab, origin);
         self.keys_on = true;
         self.keys_focus_seen = false;
         self.keys_origin = origin;
-        set_selectable(true);
+        self.set_sel(self.my_id, true);
         focus_plugin_pane(self.my_id, false, false);
     }
 
     /// Browsing onto another tab shows it right away; keyboard mode moves to
     /// that tab's sidebar instance (only one plugin pane can hold the keys).
     fn browse_to(&mut self, position: usize, pane: Option<u32>) {
+        if self.role == Role::Brain {
+            // one brain: the keys move with the tab (see `follow_active_screen`);
+            // the focus leaving this tab's sidebar is not a click elsewhere
+            self.keys_focus_seen = false;
+            self.pending_pane = pane;
+            if let Some(id) = pane {
+                self.highlight(Some(id));
+            }
+            switch_tab_to(position as u32 + 1);
+            return;
+        }
         let Some(&target) = self.sidebar_by_tab.get(&position) else {
             return;
         };
@@ -1827,10 +1941,16 @@ impl State {
         self.pending_pane = None;
         self.highlight(None);
         if self.pinned {
-            set_selectable(false);
+            self.set_sel(self.my_id, false);
         }
         if restore_focus {
-            if let Some(id) = self.prev_focus {
+            // the brain's last focus may be in the tab browsing started from:
+            // in another tab the tab's own focused pane takes over
+            let id = self
+                .prev_focus
+                .filter(|id| self.role != Role::Brain || self.pane_tab.get(id) == self.my_tab.as_ref())
+                .or_else(|| self.my_tab.and_then(|t| self.tab_panes.get(&t)).and_then(|ps| ps.iter().find(|p| p.2).or(ps.first())).map(|p| p.0));
+            if let Some(id) = id {
                 focus_terminal_pane(id, false, false);
             }
         }
@@ -2387,9 +2507,13 @@ impl State {
     }
 }
 
-#[cfg(not(test))]
-impl ZellijPlugin for State {
-    fn load(&mut self, configuration: BTreeMap<String, String>) {
+/// The plugin's own handling (local change: wrapped by the brain/screen roles
+/// in `impl ZellijPlugin` below).
+impl State {
+    fn load_inner(&mut self, configuration: BTreeMap<String, String>) {
+        if configuration.get("role").map(String::as_str) == Some("brain") {
+            self.role = Role::Brain;
+        }
         self.separator = configuration
             .get("separator")
             .and_then(|s| s.chars().next())
@@ -2433,6 +2557,7 @@ impl ZellijPlugin for State {
         self.status_view =
             configuration.get("default_view").map(String::as_str) == Some("status");
         self.my_id = get_plugin_ids().plugin_id;
+        self.self_id = self.my_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -2458,14 +2583,21 @@ impl ZellijPlugin for State {
         self.ensure_timer();
     }
 
-    fn update(&mut self, event: Event) -> bool {
+    fn update_inner(&mut self, event: Event) -> bool {
         match event {
             // Not in load(): a non-selectable pane can't take the `y` answer to the
             // permission prompt, so pin only after the grant (cached grants fire it too).
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                if self.role == Role::Brain {
+                    // to every plugin: the screens that load before the brain
+                    pipe_message_to_plugin(MessageToPlugin::new("vtabs-brain"));
+                    return false;
+                }
                 if self.pinned {
                     set_selectable(false);
                 }
+                // a brain already running answers with vtabs-brain
+                pipe_message_to_plugin(MessageToPlugin::new("vtabs-hello"));
                 false
             }
             Event::SessionUpdate(sessions, _) => {
@@ -2482,12 +2614,19 @@ impl ZellijPlugin for State {
                 if mode_info.session_name != self.session {
                     self.session = mode_info.session_name;
                     self.load_state();
+                    if self.role == Role::Brain {
+                        self.load_unread();
+                        self.load_worktrees();
+                    }
                     return true;
                 }
                 false
             }
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
+                if self.role == Role::Brain {
+                    self.follow_active_screen();
+                }
                 self.mark_focused_read();
                 // Pick up order/collapse changes written by other instances —
                 // every tab switch fires a TabUpdate, so the visible sidebar
@@ -2531,6 +2670,22 @@ impl ZellijPlugin for State {
             }
             Event::PaneClosed(PaneId::Terminal(id)) => self.forget_pane(id),
             Event::Timer(_) => {
+                if !self.tabs_to_close.is_empty() {
+                    // positions in a PaneUpdate can predate a closed tab: check
+                    // against a fresh snapshot before closing anything
+                    let me = get_session_list().ok().and_then(|l| l.live_sessions.into_iter().find(|s| s.is_current_session));
+                    for id in std::mem::take(&mut self.tabs_to_close) {
+                        let empty = me.as_ref().is_some_and(|me| {
+                            me.tabs.iter().find(|t| t.tab_id == id).is_some_and(|t| {
+                                me.panes.panes.get(&t.position).is_some_and(|ps| ps.iter().all(|p| p.is_plugin))
+                            })
+                        });
+                        if empty {
+                            vlog!("close empty tab id={}", id);
+                            close_tab_with_id(id as u64);
+                        }
+                    }
+                }
                 if self.close_pending {
                     self.close_pending = false;
                     self.had_terminal = false;
@@ -2556,6 +2711,22 @@ impl ZellijPlugin for State {
                 redraw
             }
             Event::PaneUpdate(manifest) => {
+                if self.role == Role::Brain {
+                    self.screen_size = manifest
+                        .panes
+                        .values()
+                        .flatten()
+                        // the brain is listed too (as a pane in no layout)
+                        .filter(|p| is_sidebar(p) && p.id != self.self_id)
+                        .map(|p| (p.id, (p.pane_rows, p.pane_columns)))
+                        .collect();
+                    self.close_emptied_tabs(&manifest);
+                    if let Some(active) = self.tabs.iter().find(|t| t.active).map(|t| t.position) {
+                        if let Some(p) = manifest.panes.get(&active).and_then(|ps| ps.iter().find(|p| is_sidebar(p) && p.id != self.self_id)) {
+                            self.my_id = p.id;
+                        }
+                    }
+                }
                 self.pane_tab.clear();
                 let mut me_focused = false;
                 let mut focused_terminal = None;
@@ -2607,11 +2778,12 @@ impl ZellijPlugin for State {
                                     );
                                 }
                                 self.my_cols = p.pane_columns;
+                                self.my_rows = p.pane_rows;
                             }
                             if p.plugin_url.as_deref() == Some("zellij:tab-bar") {
                                 self.full_cols = p.pane_columns;
                             }
-                            if my_url.is_some() && p.plugin_url == my_url {
+                            if my_url.is_some() && p.plugin_url == my_url && p.id != self.self_id {
                                 self.sidebar_by_tab.insert(*tab_pos, p.id);
                             }
                         }
@@ -2632,7 +2804,7 @@ impl ZellijPlugin for State {
                 // Auto-close: Zellij keeps a tab while any pane is left, and the sidebar
                 // is one — so `exit` in the last terminal left a tab with just the
                 // sidebar. Each instance closes only its own tab.
-                if let Some(my_tab) = self.my_tab {
+                if let Some(my_tab) = self.my_tab.filter(|_| self.role != Role::Brain) {
                     let terminals = manifest
                         .panes
                         .get(&my_tab)
@@ -2751,8 +2923,8 @@ impl ZellijPlugin for State {
                     // wrong tab active. Take both from the session's own snapshot.
                     if let Some(me) = get_session_list().ok().and_then(|l| l.live_sessions.into_iter().find(|s| s.is_current_session)) {
                         vlog!("visible catch-up my_id={} tabs={}", self.my_id, me.tabs.len());
-                        self.update(Event::TabUpdate(me.tabs));
-                        self.update(Event::PaneUpdate(me.panes));
+                        self.update_inner(Event::TabUpdate(me.tabs));
+                        self.update_inner(Event::PaneUpdate(me.panes));
                     }
                     self.load_worktrees();
                     // a click on this tab's row in the sidebar shown before (read once)
@@ -2810,14 +2982,15 @@ impl ZellijPlugin for State {
     }
 
     /// Attention signals: `zellij-vtabs::waiting|completed::<pane_id>` (broadcast CLI pipe).
-    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+    fn pipe_inner(&mut self, pipe_message: PipeMessage) -> bool {
         if pipe_message.name == "vtabs-focus" {
             // Every instance (one per tab) gets the message; only the one whose tab
             // holds the client's focused pane acts. Not self.tabs: hidden instances
             // miss TabUpdates, so each believes its own tab is still the active one.
             // Not the returned tab index either: it is the tab *id*, which drifts
             // from the position once a tab is closed. pane_tab is fresh (PaneUpdate).
-            let Ok((_, PaneId::Terminal(focused))) = get_focused_pane_info() else {
+            let info = get_focused_pane_info();
+            let Ok((_, PaneId::Terminal(focused))) = info else {
                 return false;
             };
             // an instance that has not learned its tab yet (no PaneUpdate since a
@@ -2961,7 +3134,214 @@ impl ZellijPlugin for State {
         false
     }
 
-    fn render(&mut self, rows: usize, cols: usize) {
+    /// Brain: the active tab's sidebar is the one drawn for and given the keys.
+    fn follow_active_screen(&mut self) {
+        let Some(active) = self.tabs.iter().find(|t| t.active).map(|t| t.position) else { return };
+        let old = self.my_id;
+        self.my_tab = Some(active);
+        if let Some(&id) = self.sidebar_by_tab.get(&active) {
+            self.my_id = id;
+        }
+        if let Some(&(r, c)) = self.screen_size.get(&self.my_id) {
+            if c != self.my_cols {
+                vlog!("follow tab={} screen={} size={:?} cols {} -> {}", active, self.my_id, self.screen_size, self.my_cols, c);
+            }
+            self.my_rows = r;
+            self.my_cols = c;
+        }
+        if self.my_id != old && self.keys_on {
+            vlog!("keys follow tab={} screen {} -> {}", active, old, self.my_id);
+            if self.pinned {
+                self.set_sel(old, false);
+            }
+            self.keys_focus_seen = false;
+            self.set_sel(self.my_id, true);
+            focus_plugin_pane(self.my_id, false, false);
+        }
+    }
+
+    /// Brain: Zellij keeps a tab while any pane is left and the sidebar is
+    /// one, so `exit` in its last terminal left a tab with just the sidebar.
+    /// Such a tab is closed on the next timer tick (see `Event::Timer`).
+    fn close_emptied_tabs(&mut self, manifest: &PaneManifest) {
+        for t in &self.tabs {
+            let terminals = manifest.panes.get(&t.position).map_or(0, |ps| ps.iter().filter(|p| !p.is_plugin).count());
+            if terminals > 0 {
+                self.tabs_with_terminal.insert(t.tab_id);
+                self.tabs_to_close.remove(&t.tab_id);
+            } else if self.tabs_with_terminal.remove(&t.tab_id) {
+                self.tabs_to_close.insert(t.tab_id);
+            }
+        }
+    }
+
+    /// Brain: send screen `to` its frame, unless it has it already.
+    fn push_frame(&mut self, to: u32) {
+        let Some(&(rows, cols)) = self.screen_size.get(&to) else { return };
+        let text = self.frame(rows, cols);
+        if self.sent_frames.get(&to) == Some(&text) {
+            return;
+        }
+        self.sent_frames.insert(to, text.clone());
+        pipe_message_to_plugin(MessageToPlugin::new("vtabs-frame").with_destination_plugin_id(to).with_payload(text));
+    }
+
+    fn to_brain(&self, name: &str, payload: String) {
+        if let Some(brain) = self.brain_id {
+            pipe_message_to_plugin(MessageToPlugin::new(name).with_destination_plugin_id(brain).with_payload(payload));
+        }
+    }
+
+    fn become_screen(&mut self, brain: u32) {
+        vlog!("screen my_id={} brain={} (was {:?})", self.my_id, brain, self.role);
+        self.brain_id = Some(brain);
+        if self.role == Role::Screen {
+            return;
+        }
+        self.role = Role::Screen;
+        self.keys_on = false;
+        unsubscribe(&[
+            EventType::ModeUpdate,
+            EventType::TabUpdate,
+            EventType::PaneUpdate,
+            EventType::Timer,
+            EventType::SessionUpdate,
+            EventType::PaneClosed,
+            EventType::RunCommandResult,
+        ]);
+        if self.pinned {
+            set_selectable(false);
+        }
+    }
+
+    fn screen_update(&mut self, event: Event) -> bool {
+        match event {
+            Event::Key(key) => self.to_brain("vtabs-key", encode_key(&key)),
+            Event::Mouse(mouse) => {
+                if let Some(m) = encode_mouse(&mouse) {
+                    self.to_brain("vtabs-mouse", m);
+                }
+            }
+            Event::Visible(visible) => {
+                self.hidden = !visible;
+                if visible {
+                    self.to_brain("vtabs-shown", String::new());
+                }
+            }
+            Event::PermissionRequestResult(_) => return self.update_inner(event),
+            _ => {}
+        }
+        false
+    }
+
+    fn brain_pipe(&mut self, msg: PipeMessage) -> bool {
+        let from = match msg.source {
+            PipeSource::Plugin(id) => Some(id),
+            _ => None,
+        };
+        let payload = msg.payload.clone().unwrap_or_default();
+        match msg.name.as_str() {
+            "vtabs-hello" | "vtabs-shown" => {
+                let Some(id) = from else { return false };
+                if msg.name == "vtabs-hello" {
+                    pipe_message_to_plugin(MessageToPlugin::new("vtabs-brain").with_destination_plugin_id(id));
+                }
+                self.sent_frames.remove(&id);
+                self.push_frame(id);
+            }
+            "vtabs-key" => {
+                if let Some(key) = decode_key(&payload) {
+                    self.handle_key(key);
+                }
+                self.push_frame(self.my_id);
+            }
+            "vtabs-mouse" => {
+                if let Some(m) = decode_mouse(&payload) {
+                    self.handle_mouse(m);
+                }
+                self.push_frame(self.my_id);
+            }
+            // Two brains would do everything twice (one from load_plugins, one
+            // started by hand): the newer one, with the higher id, leaves, and
+            // the older one tells the screens again who their brain is.
+            "vtabs-brain" => match from {
+                Some(other) if other < self.self_id => {
+                    vlog!("brain {} leaves: brain {} runs", self.self_id, other);
+                    close_self();
+                }
+                Some(other) if other > self.self_id => {
+                    pipe_message_to_plugin(MessageToPlugin::new("vtabs-brain"));
+                }
+                _ => {}
+            },
+            "vtabs-frame" | "vtabs-cmd" => {}
+            _ => {
+                self.pipe_inner(msg);
+                self.push_frame(self.my_id);
+            }
+        }
+        false
+    }
+
+    /// Legacy and screen instances.
+    fn screen_pipe(&mut self, msg: PipeMessage) -> bool {
+        let from = match msg.source {
+            PipeSource::Plugin(id) => Some(id),
+            _ => None,
+        };
+        match msg.name.as_str() {
+            "vtabs-brain" => {
+                if let Some(id) = from.filter(|id| *id != self.my_id) {
+                    self.become_screen(id);
+                    if !self.hidden {
+                        self.to_brain("vtabs-shown", String::new());
+                    }
+                }
+                return false;
+            }
+            "vtabs-frame" => {
+                if self.role == Role::Screen {
+                    self.frame_text = msg.payload.unwrap_or_default();
+                    return true;
+                }
+                return false;
+            }
+            "vtabs-cmd" => {
+                match msg.payload.as_deref() {
+                    Some("selectable") => {
+                        set_selectable(true);
+                        focus_plugin_pane(self.my_id, false, false);
+                    }
+                    Some("pinned") => set_selectable(false),
+                    _ => {}
+                }
+                return false;
+            }
+            "vtabs-hello" => return false,
+            // `zellij pipe --name vtabs-start-brain`: a session started before
+            // the brain was in load_plugins gets one from its visible sidebar
+            "vtabs-start-brain" => {
+                if self.role == Role::Legacy && !self.hidden && self.brain_id.is_none() {
+                    vlog!("start brain my_id={}", self.my_id);
+                    let config = BTreeMap::from([("role".to_string(), "brain".to_string())]);
+                    load_new_plugin("zellij:OWN_URL", config, true, false);
+                }
+                return false;
+            }
+            _ => {}
+        }
+        if self.role == Role::Screen {
+            // a keybinding's message (Alt+w) is for the brain; CLI broadcasts reach it directly
+            if matches!(msg.source, PipeSource::Keybind) {
+                self.to_brain(&msg.name, msg.payload.unwrap_or_default());
+            }
+            return false;
+        }
+        self.pipe_inner(msg)
+    }
+
+    /// The sidebar's text for a pane of `rows` x `cols`.
+    fn frame(&mut self, rows: usize, cols: usize) -> String {
         let visible = self.build_rows();
         let pad = " ".repeat(LEFT_PAD);
         let mut out = String::new();
@@ -2970,11 +3350,11 @@ impl ZellijPlugin for State {
         }
         if visible.is_empty() {
             out.push_str(&format!("{}\u{1b}[2m(no tabs)\u{1b}[0m", pad));
-            print!("{}", out);
-            return;
+            return out;
         }
         // collapsed sidebar (local change): only the state icons, one per row
-        let narrow = self.width_saved.is_some() || cols < NARROW_COLS;
+        // the brain's width_saved is the active tab's, not this pane's
+        let narrow = self.width_saved.is_some() && self.role != Role::Brain || cols < NARROW_COLS;
         for (i, row) in visible.iter().enumerate() {
             let core = if narrow {
                 match row {
@@ -3092,6 +3472,39 @@ impl ZellijPlugin for State {
                 }
             }
         }
+        out
+    }
+}
+
+#[cfg(not(test))]
+impl ZellijPlugin for State {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.load_inner(configuration);
+    }
+
+    fn update(&mut self, event: Event) -> bool {
+        match self.role {
+            Role::Legacy => self.update_inner(event),
+            Role::Screen => self.screen_update(event),
+            Role::Brain => {
+                // a resize or a moved selection changes the frame too: it is
+                // compared with the last one sent, not trusted to the return value
+                self.update_inner(event);
+                self.push_frame(self.my_id);
+                false
+            }
+        }
+    }
+
+    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        match self.role {
+            Role::Brain => self.brain_pipe(pipe_message),
+            _ => self.screen_pipe(pipe_message),
+        }
+    }
+
+    fn render(&mut self, rows: usize, cols: usize) {
+        let out = if self.role == Role::Screen { self.frame_text.clone() } else { self.frame(rows, cols) };
         print!("{}", out);
     }
 }
@@ -3194,6 +3607,29 @@ fn truncate_visible(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_and_clicks_roundtrip_through_the_pipe_codec() {
+        let mut shift_up = KeyWithModifier::new(BareKey::Up);
+        shift_up.key_modifiers.insert(KeyModifier::Shift);
+        for k in [
+            KeyWithModifier::new(BareKey::Char('r')),
+            KeyWithModifier::new(BareKey::Char('д')),
+            KeyWithModifier::new(BareKey::Char(' ')),
+            KeyWithModifier::new(BareKey::Char('-')),
+            KeyWithModifier::new(BareKey::Esc),
+            KeyWithModifier::new(BareKey::Enter),
+            KeyWithModifier::new(BareKey::PageDown),
+            KeyWithModifier::new(BareKey::F(5)),
+            shift_up,
+        ] {
+            assert_eq!(decode_key(&encode_key(&k)).as_ref(), Some(&k), "{:?}", encode_key(&k));
+        }
+        for m in [Mouse::LeftClick(3, 7), Mouse::ScrollUp(1), Mouse::ScrollDown(2)] {
+            let back = decode_mouse(&encode_mouse(&m).unwrap()).unwrap();
+            assert_eq!(format!("{:?}", back), format!("{:?}", m));
+        }
+    }
 
     #[test]
     fn shell_prompt_title() {

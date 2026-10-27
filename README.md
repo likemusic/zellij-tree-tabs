@@ -395,6 +395,21 @@ the sidebar's column math.
 
 ## Architecture notes (why it's built this way)
 
+### One brain, a screen per tab
+
+The sidebar sits in the layout's tab template, so Zellij runs one instance of the plugin per tab, and it sends tab and pane updates only to the plugins of the active tab (`targeted_plugin_ids` in `zellij-server/src/screen.rs`). The instances of the other tabs went stale and had to sync through files and hand the keyboard over to each other. Now one more instance runs headless — loaded through `load_plugins` with `role "brain"` — and Zellij sends it every update. The brain keeps all the state, draws the frame for the active tab's sidebar (a screen) and sends it there (`vtabs-frame`); screens send it their keys, clicks and Alt+w (`vtabs-key`, `vtabs-mouse`, `vtabs-focus`) and only make their own pane selectable when told (`vtabs-cmd`). A screen without a brain works on its own, as before.
+
+```kdl
+load_plugins {
+    "file:/home/you/.config/zellij/plugins/zellij-vtabs.wasm" {
+        role "brain"
+    }
+}
+```
+
+A session started before that entry gets its brain from the visible sidebar: `zellij pipe --name vtabs-start-brain`. Two brains (that pipe plus `load_plugins`) find each other: the newer one closes itself. To reload the brain after a rebuild: `zellij action start-or-reload-plugin -c role=brain file:…/zellij-vtabs.wasm` (the screens: the same without `-c`).
+
+
 The one non-obvious design decision, learned the hard way:
 
 **Zellij spawns one plugin instance per tab, and per-instance mutable state always diverges** —
