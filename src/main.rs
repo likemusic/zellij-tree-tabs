@@ -1841,6 +1841,27 @@ impl State {
         }
     }
 
+    /// Key hints for the footer: while renaming, or in keyboard mode.
+    fn key_hints(&self) -> Option<Vec<&'static str>> {
+        if self.renaming.is_some() {
+            return Some(vec!["Enter save  Esc cancel"]);
+        }
+        if !self.keys_on {
+            return None;
+        }
+        Some(if self.status_view {
+            vec!["↑↓ select  Enter go", "v projects  r rename", "-= width  Esc exit"]
+        } else {
+            vec![
+                "↑↓ select  Enter go",
+                "←→ fold  ⇧↑↓ reorder",
+                "r rename  m to session",
+                "v by state  -= width",
+                "Esc exit",
+            ]
+        })
+    }
+
     /// Pick the tab under the selection (a pane row: its tab) for moving.
     fn start_move(&mut self) -> bool {
         let position = match self.build_rows().get(self.selected) {
@@ -2635,7 +2656,7 @@ impl ZellijPlugin for State {
         false
     }
 
-    fn render(&mut self, _rows: usize, cols: usize) {
+    fn render(&mut self, rows: usize, cols: usize) {
         let visible = self.build_rows();
         let pad = " ".repeat(LEFT_PAD);
         let mut out = String::new();
@@ -2736,6 +2757,20 @@ impl ZellijPlugin for State {
             for l in menu {
                 out.push_str(&truncate_visible(&format!("{}{}", pad, l), cols));
                 out.push_str("\u{1b}[0m\r\n");
+            }
+        } else if let Some(hints) = self.key_hints() {
+            // the sidebar's keys at its bottom while it has them (local change):
+            // Zellij's status bar is another plugin and can't list them
+            let used = out.matches("\r\n").count();
+            if !narrow && rows >= used + hints.len() + 1 {
+                out.push_str(&"\r\n".repeat(rows - used - hints.len()));
+                for (i, l) in hints.iter().enumerate() {
+                    out.push_str(&truncate_visible(&format!("{}\u{1b}[2m{}\u{1b}[22m", pad, l), cols));
+                    out.push_str("\u{1b}[0m");
+                    if i + 1 < hints.len() {
+                        out.push_str("\r\n");
+                    }
+                }
             }
         }
         print!("{}", out);

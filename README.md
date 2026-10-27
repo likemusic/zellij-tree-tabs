@@ -63,6 +63,7 @@ pipe marks a pane read (used when restoring marks after a plugin reload).
 - **Auto-grouping (opt-in)** — a small shell script pipes each pane's starting directory
   (+ git facts) to the plugin, which auto-names still-default tabs (`repo:branch`,
   `repo:worktree`, …) by configurable rules. Manual names always win. See below.
+- **Key hints** — while the sidebar has the keys, its bottom lists them (Zellij's status bar is another plugin and can't).
 - **Navigate** with `j`/`k`/arrows, `Enter`/`Space` to switch tab or toggle a group. As in a file tree, `←`/`h` folds an open group or goes up to the group (a pane row: to its tab), `→`/`l` unfolds a folded group or steps into an open one.
 - **Mouse**: left-click to switch/toggle, scroll to move the selection.
 - **Active tab** marked with `●`; the selection highlight follows it.
