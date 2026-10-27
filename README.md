@@ -304,6 +304,19 @@ wins; `/**` matches the directory itself and everything below it:
 /home/me/Projects/hospice.by/** -> hospice.by
 ```
 
+Groups nest: `TM/corp-back` in a rule, or `TM:corp-back:task` as a tab name (everything
+before the last separator is the group path). A group ending in `*` continues with the
+directories below the rule's base, so one rule builds the tree from the folder layout:
+
+```text
+/home/me/Projects/** -> *          # ~/Projects/a/b -> group a/b
+/home/me/work/** -> Work/*         # ~/work/x -> Work/x
+```
+
+Directory levels holding a single tab fold away (a project folder with one tab sits in
+its parent), and a group with no tabs of its own and a single subgroup shows as one
+`a/b` row.
+
 Put them in the file `vtabs-groups` in the plugin's cache dir
 (`~/.cache/zellij/file:<plugin path>/plugin_cache/vtabs-groups`; `#` starts a comment),
 or as `dirgroup_N "glob -> group"` keys in the layout's `plugin` block. The file is

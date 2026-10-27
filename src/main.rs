@@ -211,14 +211,126 @@ fn derive_auto_name(
     }
 }
 
-/// Group of the first `dirgroup_N` rule matching `cwd` (the directory itself
-/// or anything below it for a `/**` pattern).
-fn dir_group<'a>(rules: &'a [(String, String)], cwd: &str) -> Option<&'a str> {
+/// Where a `glob -> group` rule puts a tab working in `cwd` (local change):
+/// the group's `/`-separated path, and how many of its segments were named —
+/// a group ending in `*` continues with the directories below the rule's base
+/// (`~/Projects/** -> *`: `a/b` for `~/Projects/a/b`), which `fold_paths`
+/// later drops where they would hold a single tab.
+fn dir_group_path(rules: &[(String, String)], cwd: &str) -> Option<(Vec<String>, usize)> {
     let cwd = cwd.trim_end_matches('/');
     rules.iter().find_map(|(pattern, group)| {
-        (cwd == pattern.trim_end_matches("/**") || glob_match::glob_match(pattern, cwd))
-            .then_some(group.as_str())
+        if !(cwd == pattern.trim_end_matches("/**") || glob_match::glob_match(pattern, cwd)) {
+            return None;
+        }
+        let (named, auto) = match group.strip_suffix('*') {
+            Some(p) => (p, true),
+            None => (group.as_str(), false),
+        };
+        let mut segs = path_segments(named, '/');
+        let fixed = segs.len();
+        if auto {
+            let base = &pattern[..pattern.find(['*', '?', '[', '{']).unwrap_or(pattern.len())];
+            if let Some(rest) = cwd.strip_prefix(base.trim_end_matches('/')) {
+                segs.extend(path_segments(rest, '/'));
+            }
+        }
+        Some((segs, fixed))
     })
+}
+
+fn path_segments(s: &str, sep: char) -> Vec<String> {
+    s.split(sep).map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect()
+}
+
+/// Final group path of each tab: directory segments (past the first `fixed`)
+/// are dropped from the end while the group they end in would hold only this
+/// tab — a project folder with one tab is not worth a level of its own.
+fn fold_paths(raw: &[(Vec<String>, usize)]) -> Vec<Vec<String>> {
+    raw.iter()
+        .map(|(segs, fixed)| {
+            let mut n = segs.len();
+            while n > *fixed
+                && raw.iter().filter(|(o, _)| o.len() >= n && o[..n] == segs[..n]).count() == 1
+            {
+                n -= 1;
+            }
+            segs[..n].to_vec()
+        })
+        .collect()
+}
+
+fn parent_path(path: &str) -> &str {
+    path.rfind('/').map_or("", |i| &path[..i])
+}
+
+fn leaf_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Every group path with its ancestors, in first-appearance order of `paths`
+/// (tabs by position).
+fn appearance_paths<'a>(paths: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in paths {
+        let mut end = 0;
+        for seg in p.split('/') {
+            end += seg.len();
+            let prefix = p[..end].to_string();
+            if !out.contains(&prefix) {
+                out.push(prefix);
+            }
+            end += 1;
+        }
+    }
+    out
+}
+
+/// A group row of the tree, in display order (depth first).
+#[derive(Debug, PartialEq)]
+struct GroupNode {
+    /// the group's path: collapse and tab-order key
+    path: String,
+    /// shown name: a chain of groups that hold no tabs and one subgroup each
+    /// is one row, `a/b`
+    label: String,
+    /// top of that chain — the node that is ordered among its siblings
+    top: String,
+    depth: usize,
+}
+
+/// The group tree of `paths` (each tab's group path, empty = none) as rows,
+/// siblings in `order` (paths not in it last).
+fn group_tree(paths: &[String], order: &[String]) -> Vec<GroupNode> {
+    let all = appearance_paths(paths.iter());
+    let rank = |p: &String| order.iter().position(|o| o == p).unwrap_or(usize::MAX);
+    // parent path -> children paths, sibling order
+    let mut children: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+    for p in &all {
+        children.entry(parent_path(p)).or_default().push(p);
+    }
+    for c in children.values_mut() {
+        c.sort_by_key(|p| rank(p));
+    }
+    let mut out = Vec::new();
+    // depth-first, explicit stack: (top of a row, depth), next sibling last
+    let mut stack: Vec<(&String, usize)> =
+        children.get("").into_iter().flatten().rev().map(|p| (*p, 0)).collect();
+    while let Some((top, depth)) = stack.pop() {
+        let mut cur = top;
+        let mut label = leaf_name(top).to_string();
+        while let Some([only]) = children.get(cur.as_str()).map(Vec::as_slice) {
+            if paths.contains(cur) {
+                break;
+            }
+            cur = only;
+            label = format!("{}/{}", label, leaf_name(cur));
+        }
+        out.push(GroupNode { path: cur.clone(), label, top: top.clone(), depth });
+        if let Some(kids) = children.get(cur.as_str()) {
+            stack.extend(kids.iter().rev().map(|k| (*k, depth + 1)));
+        }
+    }
+    out
 }
 
 /// Rollup priority for collapsed group headers: waiting > working > completed.
@@ -551,49 +663,77 @@ struct TabItem {
 }
 
 enum Row {
-    Group { name: String, collapsed: bool, count: usize, attention: Option<Attention> },
-    Tab { position: usize, label: String, active: bool, attention: Option<Attention> },
+    /// `name`: the group's path (`a/b`, collapse and order key); `label`: what is
+    /// shown (a chain of single-subgroup groups is one row); `depth`: nesting
+    Group { name: String, label: String, depth: usize, collapsed: bool, count: usize, attention: Option<Attention> },
+    Tab { position: usize, label: String, depth: usize, active: bool, attention: Option<Attention> },
     /// a terminal pane of the tab above, listed when the tab has 2+ panes;
     /// keyboard mode browses onto it (frame highlighted), Enter/click focuses it
     /// `flat`: a session row of the status view — no tree branch, tab-row indent
-    Pane { id: u32, title: String, focused: bool, last: bool, flat: bool, attention: Option<Attention> },
+    Pane { id: u32, title: String, depth: usize, focused: bool, last: bool, flat: bool, attention: Option<Attention> },
 }
 
 impl State {
+    /// Group path (`/`-joined) and label from a tab name: everything before the
+    /// last separator is the group, nested at each separator (`a:b:label` is
+    /// `label` in `a/b`). No separator: General.
     fn group_of<'a>(&self, name: &'a str) -> (String, &'a str) {
-        match name.find(self.separator) {
-            Some(i) => (
-                name[..i].to_string(),
-                name[i + self.separator.len_utf8()..].trim_start(),
-            ),
+        match name.rfind(self.separator) {
+            Some(i) => {
+                let segs = path_segments(&name[..i], self.separator);
+                let label = name[i + self.separator.len_utf8()..].trim_start();
+                (if segs.is_empty() { "General".to_string() } else { segs.join("/") }, label)
+            }
             None => ("General".to_string(), name),
         }
     }
 
-    /// A tab's group and label: the name's `group:` prefix, else the
-    /// `dirgroup_N` rule its working directory matches, else General.
-    fn group_of_tab<'a>(&self, position: usize, base: &'a str) -> (String, &'a str) {
-        if base.contains(self.separator) {
-            return self.group_of(base);
-        }
-        let group = self.tab_cwd.get(&position).and_then(|cwd| dir_group(&self.dir_groups, cwd));
-        match group {
-            Some(g) => (g.to_string(), base),
-            None => self.group_of(base),
-        }
+    /// Group path of every tab, by position (local change): the name's prefix,
+    /// else the `dirgroup_N` rule its working directory matches (directory
+    /// levels with a single tab folded away), else General.
+    fn tab_group_paths(&self) -> BTreeMap<usize, String> {
+        let raw: Vec<(usize, (Vec<String>, usize))> = self
+            .tabs
+            .iter()
+            .map(|t| {
+                let base = parse_attention(&t.name).1;
+                let path = match base.rfind(self.separator) {
+                    Some(i) => {
+                        let segs = path_segments(&base[..i], self.separator);
+                        let n = segs.len();
+                        (segs, n)
+                    }
+                    None => self
+                        .tab_cwd
+                        .get(&t.position)
+                        .and_then(|cwd| dir_group_path(&self.dir_groups, cwd))
+                        .unwrap_or_default(),
+                };
+                (t.position, path)
+            })
+            .collect();
+        let folded = fold_paths(&raw.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>());
+        raw.iter()
+            .zip(folded)
+            .map(|((pos, _), segs)| {
+                (*pos, if segs.is_empty() { "General".to_string() } else { segs.join("/") })
+            })
+            .collect()
     }
 
-    /// Groups in first-appearance (tab position) order.
+    /// A tab's group path and its label (the name without a group prefix).
+    fn group_of_tab<'a>(&self, position: usize, base: &'a str) -> (String, &'a str) {
+        let label = self.group_of(base).1;
+        let path = self.tab_group_paths().remove(&position).unwrap_or_else(|| "General".to_string());
+        (path, label)
+    }
+
+    /// Group paths, with their ancestors, in first-appearance (tab position) order.
     fn appearance_groups(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for t in &self.tabs {
-            let (_, base) = parse_attention(&t.name);
-            let (g, _) = self.group_of_tab(t.position, base);
-            if !out.contains(&g) {
-                out.push(g);
-            }
-        }
-        out
+        let paths = self.tab_group_paths();
+        let mut tabs: Vec<&TabInfo> = self.tabs.iter().collect();
+        tabs.sort_by_key(|t| t.position);
+        appearance_paths(tabs.iter().filter_map(|t| paths.get(&t.position)))
     }
 
     fn display_group_order(&self) -> Vec<String> {
@@ -648,12 +788,15 @@ impl State {
         let _ = std::fs::write(path, serialize_state(&p));
     }
 
-    /// Groups in display order, each with its tabs in display order.
+    /// Groups in display order (the tree, depth first), each with its own tabs
+    /// in display order; groups holding only subgroups are left out.
     fn grouped_items(&self) -> Vec<(String, Vec<TabItem>)> {
+        let paths = self.tab_group_paths();
         let mut groups: BTreeMap<String, Vec<TabItem>> = BTreeMap::new();
         for t in &self.tabs {
             let (attention, base) = parse_attention(&t.name);
-            let (g, label) = self.group_of_tab(t.position, base);
+            let label = self.group_of(base).1;
+            let g = paths.get(&t.position).cloned().unwrap_or_else(|| "General".to_string());
             groups.entry(g).or_default().push(TabItem {
                 position: t.position,
                 label: label.to_string(),
@@ -661,14 +804,15 @@ impl State {
                 attention: self.pane_rollup(t.position).or(attention),
             });
         }
-        self.display_group_order()
-            .iter()
-            .filter_map(|g| {
-                let mut items = groups.remove(g)?;
-                if let Some(saved) = self.tab_order.get(g) {
+        let names: Vec<String> = groups.keys().cloned().collect();
+        group_tree(&names, &self.display_group_order())
+            .into_iter()
+            .filter_map(|n| {
+                let mut items = groups.remove(&n.path)?;
+                if let Some(saved) = self.tab_order.get(&n.path) {
                     sort_by_saved(&mut items, saved);
                 }
-                Some((g.clone(), items))
+                Some((n.path, items))
             })
             .collect()
     }
@@ -723,6 +867,7 @@ impl State {
                     buckets[b].push(Row::Pane {
                         id: *id,
                         title,
+                        depth: 0,
                         focused: *focused && it.active,
                         last: false,
                         flat: true,
@@ -741,7 +886,14 @@ impl State {
                 Row::Pane { attention: Some(x), .. } => Some(merge(acc, *x)),
                 _ => acc,
             });
-            rows.push(Row::Group { name: name.to_string(), collapsed, count: items.len(), attention });
+            rows.push(Row::Group {
+                name: name.to_string(),
+                label: name.to_string(),
+                depth: 0,
+                collapsed,
+                count: items.len(),
+                attention,
+            });
             if !collapsed {
                 rows.extend(items);
             }
@@ -753,40 +905,57 @@ impl State {
         if self.status_view {
             return self.status_rows();
         }
+        let mut items: BTreeMap<String, Vec<TabItem>> = self.grouped_items().into_iter().collect();
+        let names: Vec<String> = items.keys().cloned().collect();
         let mut rows = Vec::new();
-        for (g, items) in self.grouped_items() {
-            let g = &g;
-            let collapsed = self.collapsed.contains(g);
-            let group_att = items.iter().fold(None, |acc, it| match it.attention {
-                Some(x) => Some(merge(acc, x)),
-                None => acc,
-            });
+        // depth of a collapsed group whose subtree is being skipped
+        let mut skip_below: Option<usize> = None;
+        for node in group_tree(&names, &self.display_group_order()) {
+            if skip_below.is_some_and(|d| node.depth > d) {
+                continue;
+            }
+            skip_below = None;
+            let in_subtree = |g: &String| *g == node.path || g.starts_with(&format!("{}/", node.path));
+            let (count, group_att) = items
+                .iter()
+                .filter(|(g, _)| in_subtree(g))
+                .flat_map(|(_, its)| its)
+                .fold((0, None), |(n, acc), it| {
+                    (n + 1, it.attention.map_or(acc, |x| Some(merge(acc, x))))
+                });
+            let collapsed = self.collapsed.contains(&node.path);
             rows.push(Row::Group {
-                name: g.clone(),
+                name: node.path.clone(),
+                label: node.label,
+                depth: node.depth,
                 collapsed,
-                count: items.len(),
+                count,
                 attention: group_att,
             });
-            if !collapsed {
-                for it in items {
-                    let panes = self.tab_panes.get(&it.position);
-                    rows.push(Row::Tab {
-                        position: it.position,
-                        label: it.label,
-                        active: it.active,
-                        attention: it.attention,
-                    });
-                    if let Some(panes) = panes.filter(|p| p.len() > 1 || self.show_single_pane && !p.is_empty()) {
-                        for (i, (id, title, focused)) in panes.iter().enumerate() {
-                            rows.push(Row::Pane {
-                                id: *id,
-                                title: title.clone(),
-                                focused: *focused,
-                                last: i + 1 == panes.len(),
-                                flat: false,
-                                attention: self.pane_attention.get(id).copied(),
-                            });
-                        }
+            if collapsed {
+                skip_below = Some(node.depth);
+                continue;
+            }
+            for it in items.remove(&node.path).unwrap_or_default() {
+                let panes = self.tab_panes.get(&it.position);
+                rows.push(Row::Tab {
+                    position: it.position,
+                    label: it.label,
+                    depth: node.depth,
+                    active: it.active,
+                    attention: it.attention,
+                });
+                if let Some(panes) = panes.filter(|p| p.len() > 1 || self.show_single_pane && !p.is_empty()) {
+                    for (i, (id, title, focused)) in panes.iter().enumerate() {
+                        rows.push(Row::Pane {
+                            id: *id,
+                            title: title.clone(),
+                            depth: node.depth,
+                            focused: *focused,
+                            last: i + 1 == panes.len(),
+                            flat: false,
+                            attention: self.pane_attention.get(id).copied(),
+                        });
                     }
                 }
             }
@@ -935,7 +1104,7 @@ impl State {
             });
             if let Some(cwd) = cwd {
                 if self.tab_cwd.get(position) != Some(&cwd) {
-                    vlog!("tab cwd my_id={} tab={} cwd={} group={:?}", self.my_id, position, cwd, dir_group(&self.dir_groups, &cwd));
+                    vlog!("tab cwd my_id={} tab={} cwd={} group={:?}", self.my_id, position, cwd, dir_group_path(&self.dir_groups, &cwd));
                     self.tab_cwd.insert(*position, cwd);
                     changed = true;
                 }
@@ -1116,9 +1285,24 @@ impl State {
             Some(Row::Group { name, .. }) => {
                 let name = name.clone();
                 let mut order = self.display_group_order();
-                if !move_in(&mut order, &name, delta) {
+                // a chain row moves as its top group, among that group's siblings
+                let Some(top) = group_tree(&self.grouped_items().into_iter().map(|(g, _)| g).collect::<Vec<_>>(), &order)
+                    .into_iter()
+                    .find(|n| n.path == name)
+                    .map(|n| n.top)
+                else {
+                    return false;
+                };
+                let sibs: Vec<String> =
+                    order.iter().filter(|p| parent_path(p) == parent_path(&top)).cloned().collect();
+                let Some(i) = sibs.iter().position(|p| *p == top) else { return false };
+                let j = i as isize + delta;
+                if j < 0 || j as usize >= sibs.len() {
                     return false;
                 }
+                let a = order.iter().position(|p| *p == top).unwrap();
+                let b = order.iter().position(|p| *p == sibs[j as usize]).unwrap();
+                order.swap(a, b);
                 self.group_order = order;
                 self.save_state();
                 // keep the selection on the header we just moved
@@ -1163,44 +1347,61 @@ impl State {
         }
     }
 
-    /// Move `old` group's saved order/collapse/tab-order entries to `new`.
+    /// Move `old` group's saved order/collapse/tab-order entries to `new` —
+    /// its subgroups' too (`old/x` becomes `new/x`).
     fn migrate_group_state(&mut self, old: &str, new: &str) {
-        for g in self.group_order.iter_mut() {
+        let moved = |g: &str| -> Option<String> {
             if g == old {
-                *g = new.to_string();
+                Some(new.to_string())
+            } else {
+                g.strip_prefix(old).filter(|r| r.starts_with('/')).map(|r| format!("{}{}", new, r))
+            }
+        };
+        for g in self.group_order.iter_mut() {
+            if let Some(n) = moved(g) {
+                *g = n;
             }
         }
         // renaming into an existing group must not leave a duplicate entry
         let mut seen = BTreeSet::new();
         self.group_order.retain(|g| seen.insert(g.clone()));
-        if self.collapsed.remove(old) {
-            self.collapsed.insert(new.to_string());
-        }
-        if let Some(order) = self.tab_order.remove(old) {
-            self.tab_order.entry(new.to_string()).or_insert(order);
+        self.collapsed = std::mem::take(&mut self.collapsed)
+            .into_iter()
+            .map(|g| moved(&g).unwrap_or(g))
+            .collect();
+        for (g, order) in std::mem::take(&mut self.tab_order) {
+            let key = moved(&g).unwrap_or(g);
+            self.tab_order.entry(key).or_insert(order);
         }
     }
 
-    /// Rename group `old` to `new`: re-prefix every member tab (preserving
-    /// attention marks) and migrate the group's saved state.
+    /// Rename group `old` (a path) to `new` (its last segment): re-prefix every
+    /// tab in its subtree (preserving attention marks) and migrate the saved
+    /// state. A group from a directory rule becomes a named prefix this way.
     fn commit_rename(&mut self, old: &str, new: &str) {
         let new = new.trim();
-        if new.is_empty() || new == old {
+        if new.is_empty() || new == leaf_name(old) {
             return;
         }
+        let parent = parent_path(old);
+        let new_path = if parent.is_empty() { new.to_string() } else { format!("{}/{}", parent, new) };
+        let paths = self.tab_group_paths();
         for t in &self.tabs {
+            let Some(g) = paths.get(&t.position) else { continue };
+            let rest = match g.strip_prefix(old) {
+                Some(r) if r.is_empty() || r.starts_with('/') => r,
+                _ => continue,
+            };
             let (att, base) = parse_attention(&t.name);
-            let (g, label) = self.group_of_tab(t.position, base);
-            if g != old {
-                continue;
-            }
+            let label = self.group_of(base).1;
+            let prefix = format!("{}{}", new_path, rest).replace('/', &self.separator.to_string());
             let marker = att.map(marker_of).unwrap_or("");
             rename_tab(
                 t.position as u32 + 1,
-                format!("{}{}{}{}", marker, new, self.separator, label),
+                format!("{}{}{}{}", marker, prefix, self.separator, label),
             );
         }
-        self.migrate_group_state(old, new);
+        self.migrate_group_state(old, &new_path);
         self.save_state();
     }
 
@@ -1217,10 +1418,9 @@ impl State {
             return;
         }
         let marker = att.map(marker_of).unwrap_or("");
-        let name = if base.find(self.separator).is_none() {
-            new_label.to_string()
-        } else {
-            format!("{}{}{}", g, self.separator, new_label)
+        let name = match base.rfind(self.separator) {
+            None => new_label.to_string(),
+            Some(i) => format!("{}{}{}", &base[..i], self.separator, new_label),
         };
         rename_tab(position as u32 + 1, format!("{}{}", marker, name));
         if let Some(order) = self.tab_order.get_mut(&g) {
@@ -1469,7 +1669,7 @@ impl State {
                     Some(Row::Group { .. }) if self.status_view => false,
                     Some(Row::Group { name, .. }) => {
                         self.renaming =
-                            Some((RenameTarget::Group(name.clone()), name.clone()));
+                            Some((RenameTarget::Group(name.clone()), leaf_name(name).to_string()));
                         true
                     }
                     Some(Row::Tab { position, .. }) => {
@@ -2282,33 +2482,36 @@ impl ZellijPlugin for State {
                 }
             } else {
                 match row {
-                    Row::Group { name, collapsed, count, attention } => {
+                    Row::Group { name, label, depth, collapsed, count, attention } => {
+                        let indent = "  ".repeat(*depth);
                         let disc = if *collapsed { "▶" } else { "▼" };
                         let editing = match &self.renaming {
                             Some((RenameTarget::Group(o), buf)) if o == name => Some(buf),
                             _ => None,
                         };
                         if let Some(buf) = editing {
-                            format!("{} {}▏", disc, buf)
+                            format!("{}{} {}▏", indent, disc, buf)
                         } else {
                             let icon = if *collapsed { self.icon(*attention) } else { String::new() };
-                            format!("{} {}{} ({})", disc, icon, name, count)
+                            format!("{}{} {}{} ({})", indent, disc, icon, label, count)
                         }
                     }
-                    Row::Tab { position, label, active, attention } => {
+                    Row::Tab { position, label, depth, active, attention } => {
+                        let indent = "  ".repeat(*depth);
                         let dot = if *active { "●" } else { " " };
                         let editing = match &self.renaming {
                             Some((RenameTarget::Tab(p), buf)) if p == position => Some(buf),
                             _ => None,
                         };
                         if let Some(buf) = editing {
-                            format!("  {} {}▏", dot, buf)
+                            format!("{}  {} {}▏", indent, dot, buf)
                         } else {
                             let slot = self.state_slot(*attention, self.tab_background(*position));
-                            format!("  {} {}{}", dot, slot, label)
+                            format!("{}  {} {}{}", indent, dot, slot, label)
                         }
                     }
-                    Row::Pane { id, title, focused, last, flat, attention } => {
+                    Row::Pane { id, title, depth, focused, last, flat, attention } => {
+                        let indent = "  ".repeat(*depth);
                         let branch = if *last { "└" } else { "├" };
                         let icon = self.state_slot(*attention, self.background_of([id]));
                         let title = strip_claude_glyph(title);
@@ -2316,9 +2519,9 @@ impl ZellijPlugin for State {
                             let dot = if *focused { "●" } else { " " };
                             format!("  {} {}{}", dot, icon, title)
                         } else if *focused {
-                            format!("    {} {}{}", branch, icon, title)
+                            format!("{}    {} {}{}", indent, branch, icon, title)
                         } else {
-                            format!("    \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", branch, icon, title)
+                            format!("{}    \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", indent, branch, icon, title)
                         }
                     }
                 }
@@ -2498,12 +2701,44 @@ mod tests {
     }
 
     #[test]
-    fn dir_group_matches_dir_and_below() {
-        let rules = vec![("/home/u/Projects/hospice.by/**".to_string(), "hospice.by".to_string())];
-        assert_eq!(dir_group(&rules, "/home/u/Projects/hospice.by"), Some("hospice.by"));
-        assert_eq!(dir_group(&rules, "/home/u/Projects/hospice.by/SquirrelStock-sql"), Some("hospice.by"));
-        assert_eq!(dir_group(&rules, "/home/u/Projects/hospice.byx"), None);
-        assert_eq!(dir_group(&rules, "/home/u/Projects/custom.by"), None);
+    fn dir_group_path_named_and_auto() {
+        let rules = vec![
+            ("/h/P/hospice.by/**".to_string(), "hospice.by".to_string()),
+            ("/h/W/**".to_string(), "Work/*".to_string()),
+            ("/h/P/**".to_string(), "*".to_string()),
+        ];
+        let g = |c: &str| dir_group_path(&rules, c);
+        assert_eq!(g("/h/P/hospice.by"), Some((vec!["hospice.by".to_string()], 1)));
+        assert_eq!(g("/h/P/hospice.by/SS"), Some((vec!["hospice.by".to_string()], 1)));
+        assert_eq!(g("/h/P/tm/cb"), Some((vec!["tm".to_string(), "cb".to_string()], 0)));
+        assert_eq!(g("/h/W/a"), Some((vec!["Work".to_string(), "a".to_string()], 1)));
+        assert_eq!(g("/h"), None);
+    }
+
+    #[test]
+    fn fold_and_tree_drop_single_tab_levels() {
+        let v = |s: &[&str], f: usize| (s.iter().map(|x| x.to_string()).collect::<Vec<_>>(), f);
+        let raw = vec![
+            v(&["tm", "cb", "develop"], 0),
+            v(&["tm", "cb", "develop"], 0),
+            v(&["tm", "cb", "rosatom"], 0),
+            v(&["O", "belfermer"], 0),
+            v(&["hospice.by"], 1),
+        ];
+        let paths: Vec<String> = fold_paths(&raw).iter().map(|s| s.join("/")).collect();
+        assert_eq!(paths, ["tm/cb/develop", "tm/cb/develop", "tm/cb", "", "hospice.by"]);
+        let named: Vec<String> = ["tm/cb/develop", "tm/cb", "hospice.by"].iter().map(|s| s.to_string()).collect();
+        let order = appearance_paths(named.iter());
+        let rows: Vec<(String, String, usize)> =
+            group_tree(&named, &order).into_iter().map(|n| (n.label, n.top, n.depth)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("tm/cb".to_string(), "tm".to_string(), 0),
+                ("develop".to_string(), "tm/cb/develop".to_string(), 1),
+                ("hospice.by".to_string(), "hospice.by".to_string(), 0),
+            ]
+        );
     }
 
     #[test]
@@ -2512,6 +2747,7 @@ mod tests {
         assert_eq!(s.group_of("work:api"), ("work".to_string(), "api"));
         assert_eq!(s.group_of("work: api"), ("work".to_string(), "api")); // trims one space
         assert_eq!(s.group_of("scratch"), ("General".to_string(), "scratch"));
+        assert_eq!(s.group_of("TM:corp-back:task"), ("TM/corp-back".to_string(), "task"));
     }
 
     #[test]
