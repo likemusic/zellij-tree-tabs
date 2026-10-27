@@ -328,6 +328,10 @@ re-read on every tab switch and needs no layout change — a changed plugin bloc
 different plugin to Zellij, so key binds that message the old one would launch a new
 copy. Another tool can write the file too (e.g. a project tree kept elsewhere).
 
+### Bell mark
+
+A tab whose pane rang the bell while the tab was not shown gets Zellij's `[!]` after its label (and a folded group holding it, after its count) — the same mark as in Zellij's tab bar, from `TabInfo.has_bell_notification`; it goes when the tab is shown. Claude Code rings it when a turn ends.
+
 ### Folding a tab
 
 A tab with rows of its own — its panes, a worktree list — carries `▼`/`▶` before its label: `←`/`→` on the tab row or a click on the mark folds and unfolds them (Enter and a click on the label still go to the tab). Folded tabs are kept in the state file by label.

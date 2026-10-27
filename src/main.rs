@@ -168,6 +168,9 @@ fn fold_mark(fold: Option<bool>) -> &'static str {
     }
 }
 
+/// After a tab (or folded group) label: a pane there rang the bell (local change).
+const BELL_MARK: &str = " \u{1b}[1;33m[!]\u{1b}[22;39m";
+
 /// The rename buffer with a ▏ cursor `back` characters before its end.
 fn with_cursor(buf: &str, back: usize) -> String {
     let chars: Vec<char> = buf.chars().collect();
@@ -3164,6 +3167,19 @@ impl State {
         false
     }
 
+    /// Zellij's bell mark (the tab bar's `[!]`): a pane in the tab rang while
+    /// the tab was not the active one; cleared when the tab is shown.
+    fn tab_has_bell(&self, position: usize) -> bool {
+        self.tabs.iter().any(|t| t.position == position && t.has_bell_notification)
+    }
+
+    fn group_has_bell(&self, group: &str) -> bool {
+        let prefix = format!("{}/", group);
+        self.tab_group_paths()
+            .iter()
+            .any(|(pos, g)| (g == group || g.starts_with(&prefix)) && self.tab_has_bell(*pos))
+    }
+
     /// Brain: the active tab's sidebar is the one drawn for and given the keys.
     fn follow_active_screen(&mut self) {
         let Some(active) = self.tabs.iter().find(|t| t.active).map(|t| t.position) else { return };
@@ -3415,7 +3431,8 @@ impl State {
                             format!("{}  \u{1b}[2m└\u{1b}[22m {} {} ({})", indent, disc, label, count)
                         } else {
                             let icon = if *collapsed { self.icon(*attention, *unread) } else { String::new() };
-                            format!("{}{} {}{} ({})", indent, disc, icon, label, count)
+                            let bell = if *collapsed && self.group_has_bell(name) { BELL_MARK } else { "" };
+                            format!("{}{} {}{} ({}){}", indent, disc, icon, label, count, bell)
                         }
                     }
                     Row::Tab { position, label, depth, active, attention, unread, fold } => {
@@ -3431,7 +3448,8 @@ impl State {
                             format!("{}  {}{}", indent, fold_mark(*fold), with_cursor(buf, self.rename_back))
                         } else {
                             let slot = self.state_slot(*attention, *unread, self.tab_background(*position));
-                            format!("{}  {}{}{}", indent, fold_mark(*fold), slot, label)
+                            let bell = if self.tab_has_bell(*position) { BELL_MARK } else { "" };
+                            format!("{}  {}{}{}{}", indent, fold_mark(*fold), slot, label, bell)
                         }
                     }
                     Row::Pane { id, title, depth, focused, last, flat, attention, unread } => {
