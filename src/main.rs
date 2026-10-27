@@ -1037,7 +1037,15 @@ impl State {
                 let main = self.tab_cwd.get(&it.position).and_then(|c| self.cwd_repo.get(c).filter(|m| *m == c));
                 if let Some(main) = main.filter(|m| !repos_shown.contains(m)).cloned() {
                     repos_shown.push(main.clone());
-                    self.push_worktree_rows(&mut rows, &node.path, &main, node.depth + 2);
+                    let before = rows.len();
+                    // depth + 3 puts the header's ▶ right of the panes' └ (see render)
+                    self.push_worktree_rows(&mut rows, &node.path, &main, node.depth + 3);
+                    // the header continues the tab's pane tree: its last pane is no longer last
+                    if rows.len() > before {
+                        if let Some(Row::Pane { last, .. }) = rows[..before].last_mut() {
+                            *last = false;
+                        }
+                    }
                 }
             }
         }
@@ -2849,6 +2857,10 @@ impl ZellijPlugin for State {
                         };
                         if let Some(buf) = editing {
                             format!("{}{} {}▏", indent, disc, buf)
+                        } else if name.contains('⎇') {
+                            // last branch of the tab's pane tree, ▶/▼ still at 2 * depth
+                            let indent = "  ".repeat(depth.saturating_sub(3));
+                            format!("{}    \u{1b}[2m└\u{1b}[22m {} {} ({})", indent, disc, label, count)
                         } else {
                             let icon = if *collapsed { self.icon(*attention, *unread) } else { String::new() };
                             format!("{}{} {}{} ({})", indent, disc, icon, label, count)
