@@ -168,6 +168,14 @@ fn fold_mark(fold: Option<bool>) -> &'static str {
     }
 }
 
+/// The rename buffer with a ▏ cursor `back` characters before its end.
+fn with_cursor(buf: &str, back: usize) -> String {
+    let chars: Vec<char> = buf.chars().collect();
+    let at = chars.len() - back.min(chars.len());
+    let (a, b): (String, String) = (chars[..at].iter().collect(), chars[at..].iter().collect());
+    format!("{}▏{}", a, b)
+}
+
 fn basename(path: &str) -> &str {
     path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
 }
@@ -724,6 +732,8 @@ struct State {
     tabs_with_terminal: BTreeSet<usize>,
     tabs_to_close: BTreeSet<usize>,
     my_rows: usize,
+    /// rename editor's cursor: characters after it (0 = at the end)
+    rename_back: usize,
     /// this instance's own plugin id (a brain's `my_id` is the active screen's)
     self_id: u32,
 }
@@ -1778,21 +1788,40 @@ impl State {
         };
         let plain = key.key_modifiers.is_empty()
             || (key.key_modifiers.len() == 1 && key.key_modifiers.contains(&KeyModifier::Shift));
+        // the cursor as a char index (local change: ←/→/Home/End/Del)
+        let len = buf.chars().count();
+        let at = len - self.rename_back.min(len);
+        let byte = |i: usize| buf.char_indices().nth(i).map_or(buf.len(), |(b, _)| b);
         match key.bare_key {
             BareKey::Enter => {
+                self.rename_back = 0;
                 match &target {
                     RenameTarget::Group(old) => self.commit_rename(&old.clone(), &buf),
                     RenameTarget::Tab(pos) => self.commit_tab_rename(*pos, &buf),
                 }
                 return true;
             }
-            BareKey::Esc => return true, // buffer dropped = cancelled
-            BareKey::Backspace => {
-                buf.pop();
+            BareKey::Esc => {
+                self.rename_back = 0;
+                return true; // buffer dropped = cancelled
             }
+            BareKey::Backspace if at > 0 => {
+                let b = byte(at - 1);
+                buf.remove(b);
+            }
+            BareKey::Delete if at < len => {
+                let b = byte(at);
+                buf.remove(b);
+                self.rename_back -= 1;
+            }
+            BareKey::Left => self.rename_back = (len - at + 1).min(len),
+            BareKey::Right => self.rename_back = (len - at).saturating_sub(1),
+            BareKey::Home => self.rename_back = len,
+            BareKey::End => self.rename_back = 0,
             // separator/tab would corrupt group parsing / the state file format
             BareKey::Char(c) if plain && !c.is_control() && c != self.separator => {
-                buf.push(c);
+                let b = byte(at);
+                buf.insert(b, c);
             }
             _ => {}
         }
@@ -2454,6 +2483,7 @@ impl State {
 
     fn handle_mouse(&mut self, mouse: Mouse) -> bool {
         if self.renaming.take().is_some() {
+            self.rename_back = 0;
             return true; // any mouse action cancels an in-progress rename
         }
         let len = self.build_rows().len();
@@ -3378,7 +3408,7 @@ impl State {
                             _ => None,
                         };
                         if let Some(buf) = editing {
-                            format!("{}{} {}▏", indent, disc, buf)
+                            format!("{}{} {}", indent, disc, with_cursor(buf, self.rename_back))
                         } else if name.contains('⎇') {
                             // last branch of the tab's pane tree, ▶/▼ still at 2 * depth
                             let indent = "  ".repeat(depth.saturating_sub(2));
@@ -3398,7 +3428,7 @@ impl State {
                             _ => None,
                         };
                         if let Some(buf) = editing {
-                            format!("{}  {}{}▏", indent, fold_mark(*fold), buf)
+                            format!("{}  {}{}", indent, fold_mark(*fold), with_cursor(buf, self.rename_back))
                         } else {
                             let slot = self.state_slot(*attention, *unread, self.tab_background(*position));
                             format!("{}  {}{}{}", indent, fold_mark(*fold), slot, label)
@@ -3629,6 +3659,13 @@ mod tests {
             let back = decode_mouse(&encode_mouse(&m).unwrap()).unwrap();
             assert_eq!(format!("{:?}", back), format!("{:?}", m));
         }
+    }
+
+    #[test]
+    fn rename_cursor_sits_back_from_the_end() {
+        assert_eq!(with_cursor("абв", 0), "абв▏");
+        assert_eq!(with_cursor("абв", 1), "аб▏в");
+        assert_eq!(with_cursor("абв", 9), "▏абв");
     }
 
     #[test]

@@ -1,0 +1,19 @@
+#!/bin/bash
+# Install the freshly built plugin into a running session and reload it: the
+# per-tab sidebars (screens), then the brain; then re-send every pane's Claude
+# state, which a reloaded brain has lost (marked read: not news).
+set -u
+s=${1:-work}
+src=$(dirname "$0")/../target/wasm32-wasip1/release/zellij-vtabs.wasm
+url="file:$HOME/.config/zellij/plugins/zellij-vtabs.wasm"
+cp "$src" "$HOME/.config/zellij/plugins/" || exit 1
+timeout 30 zellij -s "$s" action start-or-reload-plugin "$url"
+timeout 30 zellij -s "$s" action start-or-reload-plugin -c role=brain "$url"
+sleep 3
+for f in /run/user/$(id -u)/zellij-vtabs/pane-$s-*; do
+  id=${f##*-}; case $id in *[!0-9]*) continue;; esac
+  read main subs paused < "$f" || true
+  if [ "${paused:-0}" = 1 ]; then sig=waiting; elif [ "${main:-0}" = 1 ] || [ "${subs:-0}" -gt 0 ]; then sig=working; else sig=completed; fi
+  timeout 5 zellij -s "$s" pipe --name "zellij-vtabs::$sig::$id" </dev/null
+  timeout 5 zellij -s "$s" pipe --name "zellij-vtabs::read::$id" </dev/null
+done
