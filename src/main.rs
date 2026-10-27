@@ -147,6 +147,22 @@ fn parse_facts(payload: &str) -> CwdFacts {
     f
 }
 
+/// Key of a folded tab in `collapsed`: group paths never hold a ':' (it
+/// separates the group from the label in a tab name).
+fn tab_fold_key(label: &str) -> String {
+    format!("tab:{}", label)
+}
+
+/// ▼/▶ before a tab's label when it has rows of its own (see `Row::Tab`);
+/// two blanks keep the labels of the others aligned.
+fn fold_mark(fold: Option<bool>) -> &'static str {
+    match fold {
+        Some(true) => "▶ ",
+        Some(false) => "▼ ",
+        None => "  ",
+    }
+}
+
 fn basename(path: &str) -> &str {
     path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
 }
@@ -710,7 +726,8 @@ enum Row {
     /// `name`: the group's path (`a/b`, collapse and order key); `label`: what is
     /// shown (a chain of single-subgroup groups is one row); `depth`: nesting
     Group { name: String, label: String, depth: usize, collapsed: bool, count: usize, attention: Option<Attention>, unread: bool },
-    Tab { position: usize, label: String, depth: usize, active: bool, attention: Option<Attention>, unread: bool },
+    /// `fold`: None without panes or worktrees listed under it, else whether they are folded
+    Tab { position: usize, label: String, depth: usize, active: bool, attention: Option<Attention>, unread: bool, fold: Option<bool> },
     /// a terminal pane of the tab above, listed when the tab has 2+ panes;
     /// keyboard mode browses onto it (frame highlighted), Enter/click focuses it
     /// `flat`: a session row of the status view — no tree branch, tab-row indent
@@ -1012,6 +1029,10 @@ impl State {
             let mut repos_shown: Vec<String> = Vec::new();
             for it in items.remove(&node.path).unwrap_or_default() {
                 let panes = self.tab_panes.get(&it.position);
+                let listed = panes.filter(|p| p.len() > 1 || self.show_single_pane && !p.is_empty());
+                let main = self.tab_cwd.get(&it.position).and_then(|c| self.cwd_repo.get(c).filter(|m| *m == c));
+                let main = main.filter(|m| !repos_shown.contains(m) && !self.closed_worktrees(m).is_empty()).cloned();
+                let folded = self.collapsed.contains(&tab_fold_key(&it.label));
                 rows.push(Row::Tab {
                     position: it.position,
                     label: it.label,
@@ -1019,8 +1040,15 @@ impl State {
                     active: it.active,
                     attention: it.attention,
                     unread: self.any_unread(panes.into_iter().flatten().map(|(id, _, _)| id)),
+                    fold: (listed.is_some() || main.is_some()).then_some(folded),
                 });
-                if let Some(panes) = panes.filter(|p| p.len() > 1 || self.show_single_pane && !p.is_empty()) {
+                if let Some(m) = &main {
+                    repos_shown.push(m.clone());
+                }
+                if folded {
+                    continue;
+                }
+                if let Some(panes) = listed {
                     for (i, (id, title, focused)) in panes.iter().enumerate() {
                         rows.push(Row::Pane {
                             id: *id,
@@ -1034,9 +1062,7 @@ impl State {
                         });
                     }
                 }
-                let main = self.tab_cwd.get(&it.position).and_then(|c| self.cwd_repo.get(c).filter(|m| *m == c));
-                if let Some(main) = main.filter(|m| !repos_shown.contains(m)).cloned() {
-                    repos_shown.push(main.clone());
+                if let Some(main) = main {
                     let before = rows.len();
                     // depth + 3 puts the header's ▶ right of the panes' └ (see render)
                     self.push_worktree_rows(&mut rows, &node.path, &main, node.depth + 3);
@@ -1887,8 +1913,12 @@ impl State {
         let parent_depth = match rows.get(self.selected) {
             Some(Row::Group { name, collapsed: false, .. }) => {
                 let name = name.clone();
-                self.collapsed.insert(name);
-                self.save_state();
+                self.set_folded(&name, true);
+                return true;
+            }
+            Some(Row::Tab { label, fold: Some(false), .. }) => {
+                let key = tab_fold_key(label);
+                self.set_folded(&key, true);
                 return true;
             }
             Some(Row::Group { name, .. }) if name.contains('⎇') => {
@@ -1920,17 +1950,32 @@ impl State {
         }
     }
 
-    /// →: unfold a folded group; on an open one go to its first row.
+    /// Fold or unfold a group, a worktree list or a tab (`tab_fold_key`). A
+    /// worktree list is folded by default: its key in `collapsed` means open.
+    fn set_folded(&mut self, key: &str, folded: bool) {
+        if folded != key.contains('⎇') {
+            self.collapsed.insert(key.to_string());
+        } else {
+            self.collapsed.remove(key);
+        }
+        self.save_state();
+    }
+
+    /// →: unfold a folded group or tab; on an open one go to its first row.
     fn tree_right(&mut self) -> bool {
         let rows = self.build_rows();
         match rows.get(self.selected) {
             Some(Row::Group { name, collapsed: true, .. }) => {
                 let name = name.clone();
-                self.collapsed.remove(&name);
-                self.save_state();
+                self.set_folded(&name, false);
                 true
             }
-            Some(Row::Group { .. }) if self.selected + 1 < rows.len() => {
+            Some(Row::Tab { label, fold: Some(true), .. }) => {
+                let key = tab_fold_key(label);
+                self.set_folded(&key, false);
+                true
+            }
+            Some(Row::Group { .. }) | Some(Row::Tab { fold: Some(false), .. }) if self.selected + 1 < rows.len() => {
                 self.selected += 1;
                 self.browse_row(&rows, self.selected);
                 true
@@ -2252,7 +2297,9 @@ impl State {
                 }
                 let idx = idx as usize;
                 let rows = self.build_rows();
-                if let Row::Group { depth, .. } = rows[idx] {
+                if let Row::Group { name, depth, .. } = &rows[idx] {
+                    vlog!("group click my_id={} my_tab={:?} row={} col={} group={} keys_on={}", self.my_id, self.my_tab, idx, col, name, self.keys_on);
+                    let depth = *depth;
                     // a click on the ▶/▼ folds (local change); on the name it only
                     // selects, and takes the keys so ←/→ and Enter act on it
                     self.selected = idx;
@@ -2260,6 +2307,16 @@ impl State {
                         self.activate(idx);
                     } else if !self.keys_on {
                         self.keys_on_here(self.my_tab);
+                    }
+                } else if let Row::Tab { position, label, depth, attention, unread, fold: Some(folded), .. } = &rows[idx] {
+                    // the ▼/▶ before the label folds the tab's panes and worktrees
+                    let slot = self.state_slot(*attention, *unread, self.tab_background(*position));
+                    let mark = LEFT_PAD + 2 * depth + 4 + visible_width(&slot);
+                    if col == mark || col == mark + 1 {
+                        let key = tab_fold_key(label);
+                        self.set_folded(&key, !folded);
+                    } else {
+                        self.click_row(&rows, idx);
                     }
                 } else {
                     self.click_row(&rows, idx);
@@ -2633,6 +2690,15 @@ impl ZellijPlugin for State {
                 }
                 // shown again: catch up on titles and the spinner right away
                 if visible {
+                    // A hidden instance misses TabUpdates, and the new subscription
+                    // brings no PaneUpdate until something changes: shown right after
+                    // a plugin reload it drew every tab in General, no panes, the
+                    // wrong tab active. Take both from the session's own snapshot.
+                    if let Some(me) = get_session_list().ok().and_then(|l| l.live_sessions.into_iter().find(|s| s.is_current_session)) {
+                        vlog!("visible catch-up my_id={} tabs={}", self.my_id, me.tabs.len());
+                        self.update(Event::TabUpdate(me.tabs));
+                        self.update(Event::PaneUpdate(me.panes));
+                    }
                     self.refresh_titles();
                     // misses counted while hidden say nothing about this width
                     self.width_stuck = None;
@@ -2866,15 +2932,16 @@ impl ZellijPlugin for State {
                             format!("{}{} {}{} ({})", indent, disc, icon, label, count)
                         }
                     }
-                    Row::Tab { position, label, depth, active, attention, unread } => {
+                    Row::Tab { position, label, depth, active, attention, unread, fold } => {
                         let indent = "  ".repeat(*depth);
                         let dot = if *active { "●" } else { " " };
+                        let label = format!("{}{}", fold_mark(*fold), label);
                         let editing = match &self.renaming {
                             Some((RenameTarget::Tab(p), buf)) if p == position => Some(buf),
                             _ => None,
                         };
                         if let Some(buf) = editing {
-                            format!("{}  {} {}▏", indent, dot, buf)
+                            format!("{}  {} {}{}▏", indent, dot, fold_mark(*fold), buf)
                         } else {
                             let slot = self.state_slot(*attention, *unread, self.tab_background(*position));
                             format!("{}  {} {}{}", indent, dot, slot, label)
