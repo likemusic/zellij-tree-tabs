@@ -39,6 +39,14 @@ def focus(session):
     return active, pane
 
 
+def last_click():
+    """Groups of the newest click line in the log (its last 256 KiB)."""
+    with open(LOG, "rb") as f:
+        f.seek(max(0, os.path.getsize(LOG) - 262144))
+        found = CLICK.findall(f.read().decode(errors="replace"))
+    return found[-1] if found else None
+
+
 def follow(path):
     """Log lines as they come; None every 0.3 s of silence."""
     f = open(path, errors="replace")
@@ -77,7 +85,11 @@ def main():
                 tag = "????"
             else:
                 tag = "OK  " if ok else "MISS"
-            if verbose or not ok:
+            # a click made while this one was being checked moved the focus on:
+            # not a miss of this one (the newer click is judged on its own)
+            if not ok and last_click() != (my_id, my_tab, row, tab, tab_id, pane):
+                tag = "SKIP"
+            if verbose or tag in ("MISS", "????"):
                 print("%s click from plugin %s (tab %s) on row %s: want tab %d pane %s, got %s" % (
                     tag, my_id, my_tab, row, want_tab, want_pane,
                     "no answer from zellij" if got is None else "tab %s pane %s" % got), flush=True)

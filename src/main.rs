@@ -1008,18 +1008,9 @@ impl State {
                 skip_below = Some(node.depth);
                 continue;
             }
-            let node_items = items.remove(&node.path).unwrap_or_default();
-            // repos whose main worktree a tab of this group works in
-            let mut repos: Vec<&String> = Vec::new();
-            for it in &node_items {
-                if let Some(main) = self.tab_cwd.get(&it.position).and_then(|c| self.cwd_repo.get(c).filter(|m| *m == c)) {
-                    if !repos.contains(&main) {
-                        repos.push(main);
-                    }
-                }
-            }
-            let repos: Vec<String> = repos.into_iter().cloned().collect();
-            for it in node_items {
+            // a repo's worktree list goes under the first tab in its main worktree
+            let mut repos_shown: Vec<String> = Vec::new();
+            for it in items.remove(&node.path).unwrap_or_default() {
                 let panes = self.tab_panes.get(&it.position);
                 rows.push(Row::Tab {
                     position: it.position,
@@ -1043,34 +1034,42 @@ impl State {
                         });
                     }
                 }
-            }
-            for main in repos {
-                let closed = self.closed_worktrees(&main);
-                if closed.is_empty() {
-                    continue;
-                }
-                // folded unless opened: the key is in `collapsed` while open
-                let name = format!("{}/⎇{}", node.path, basename(&main));
-                let open = self.collapsed.contains(&name);
-                rows.push(Row::Group {
-                    name,
-                    label: format!("⎇ {}", basename(&main)),
-                    depth: node.depth + 1,
-                    collapsed: !open,
-                    count: closed.len(),
-                    attention: None,
-                    unread: false,
-                });
-                if open {
-                    for (path, branch) in closed {
-                        let dir = basename(&path).to_string();
-                        let label = if branch.is_empty() || branch == dir { dir } else { format!("{} ({})", dir, branch) };
-                        rows.push(Row::Worktree { path, label, depth: node.depth + 1 });
-                    }
+                let main = self.tab_cwd.get(&it.position).and_then(|c| self.cwd_repo.get(c).filter(|m| *m == c));
+                if let Some(main) = main.filter(|m| !repos_shown.contains(m)).cloned() {
+                    repos_shown.push(main.clone());
+                    self.push_worktree_rows(&mut rows, &node.path, &main, node.depth + 2);
                 }
             }
         }
         rows
+    }
+
+    /// The folded `⎇ worktrees (N)` row of repo `main` and, unfolded, its
+    /// worktrees that nothing is open in — under the tab working in `main`.
+    fn push_worktree_rows(&self, rows: &mut Vec<Row>, group: &str, main: &str, depth: usize) {
+        let closed = self.closed_worktrees(main);
+        if closed.is_empty() {
+            return;
+        }
+        // folded unless opened: the key is in `collapsed` while open
+        let name = format!("{}/⎇{}", group, basename(main));
+        let open = self.collapsed.contains(&name);
+        rows.push(Row::Group {
+            name,
+            label: "⎇ worktrees".to_string(),
+            depth,
+            collapsed: !open,
+            count: closed.len(),
+            attention: None,
+            unread: false,
+        });
+        if open {
+            for (path, branch) in closed {
+                let dir = basename(&path).to_string();
+                let label = if branch.is_empty() || branch == dir { dir } else { format!("{} ({})", dir, branch) };
+                rows.push(Row::Worktree { path, label, depth });
+            }
+        }
     }
 
     /// Row of what has focus: the focused pane's row when the active tab lists
@@ -1882,6 +1881,15 @@ impl State {
                 let name = name.clone();
                 self.collapsed.insert(name);
                 self.save_state();
+                return true;
+            }
+            Some(Row::Group { name, .. }) if name.contains('⎇') => {
+                // a worktree list sits under its tab
+                let Some(i) = rows[..self.selected].iter().rposition(|r| matches!(r, Row::Tab { .. })) else {
+                    return false;
+                };
+                self.selected = i;
+                self.browse_row(&rows, i);
                 return true;
             }
             Some(Row::Group { depth: 0, .. }) | None => return false,
@@ -2830,7 +2838,7 @@ impl ZellijPlugin for State {
             } else {
                 match row {
                     Row::Worktree { label, depth, .. } => {
-                        format!("{}    \u{1b}[2m○ {}\u{1b}[22m", "  ".repeat(*depth), label)
+                        format!("{}  \u{1b}[2m○ {}\u{1b}[22m", "  ".repeat(*depth), label)
                     }
                     Row::Group { name, label, depth, collapsed, count, attention, unread } => {
                         let indent = "  ".repeat(*depth);

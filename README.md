@@ -330,8 +330,8 @@ copy. Another tool can write the file too (e.g. a project tree kept elsewhere).
 
 ### Worktrees with nothing open
 
-Under a group holding a tab that works in a repo's main worktree, a folded `⎇ <repo> (N)`
-row lists the repo's other worktrees (`git worktree list`, refreshed every 30 s and when the
+Under the tab that works in a repo's main worktree (after its panes), a folded
+`⎇ worktrees (N)` row lists the repo's other worktrees (`git worktree list`, refreshed every 30 s and when the
 sidebar is shown) that nothing is open in: no tab works there and no tab or pane carries the
 worktree's name — Claude sessions are often started in the main worktree and named after
 the one they work in. Unfold it with `→`, Enter or a click on a worktree opens a new tab there.
