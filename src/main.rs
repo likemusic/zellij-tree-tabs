@@ -1653,6 +1653,10 @@ impl State {
                 let sel = self.selected;
                 self.activate(sel)
             }
+            // tree keys (local change), as in a file tree; р/д: the same keys on
+            // the Russian layout
+            BareKey::Left | BareKey::Char('h') | BareKey::Char('р') => self.tree_left(),
+            BareKey::Right | BareKey::Char('l') | BareKey::Char('д') => self.tree_right(),
             // Russian layout sends the letter on the same key
             // width keys are the same on both keyboard layouts
             BareKey::Char('-') => self.change_width(false),
@@ -1686,6 +1690,56 @@ impl State {
                     }
                     Some(Row::Pane { .. }) | None => false,
                 }
+            }
+            _ => false,
+        }
+    }
+
+    /// ←: fold an open group; elsewhere go up to the row it belongs to (a pane
+    /// to its tab, a tab or folded group to its group).
+    fn tree_left(&mut self) -> bool {
+        let rows = self.build_rows();
+        let parent_depth = match rows.get(self.selected) {
+            Some(Row::Group { name, collapsed: false, .. }) => {
+                let name = name.clone();
+                self.collapsed.insert(name);
+                self.save_state();
+                return true;
+            }
+            Some(Row::Group { depth: 0, .. }) | None => return false,
+            Some(Row::Group { depth, .. }) => Some(depth - 1),
+            Some(Row::Tab { depth, .. }) => Some(*depth),
+            Some(Row::Pane { .. }) => None,
+        };
+        let up = rows[..self.selected].iter().rposition(|r| match (r, parent_depth) {
+            (Row::Group { depth, .. }, Some(d)) => *depth == d,
+            (Row::Tab { .. }, None) => true,
+            _ => false,
+        });
+        match up {
+            Some(i) => {
+                self.selected = i;
+                self.browse_row(&rows, i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// →: unfold a folded group; on an open one go to its first row.
+    fn tree_right(&mut self) -> bool {
+        let rows = self.build_rows();
+        match rows.get(self.selected) {
+            Some(Row::Group { name, collapsed: true, .. }) => {
+                let name = name.clone();
+                self.collapsed.remove(&name);
+                self.save_state();
+                true
+            }
+            Some(Row::Group { .. }) if self.selected + 1 < rows.len() => {
+                self.selected += 1;
+                self.browse_row(&rows, self.selected);
+                true
             }
             _ => false,
         }
@@ -1959,16 +2013,22 @@ impl State {
             return false;
         }
         match mouse {
-            Mouse::LeftClick(row, _col) => {
+            Mouse::LeftClick(row, col) => {
                 let idx = row - TOP_PAD as isize;
                 if idx < 0 || idx as usize >= len {
                     return false;
                 }
                 let idx = idx as usize;
                 let rows = self.build_rows();
-                if matches!(rows[idx], Row::Group { .. }) {
+                if let Row::Group { depth, .. } = rows[idx] {
+                    // a click on the ▶/▼ folds (local change); on the name it only
+                    // selects, and takes the keys so ←/→ and Enter act on it
                     self.selected = idx;
-                    self.activate(idx);
+                    if col == LEFT_PAD + 2 * depth {
+                        self.activate(idx);
+                    } else if !self.keys_on {
+                        self.keys_on_here(self.my_tab);
+                    }
                 } else {
                     self.click_row(&rows, idx);
                 }
