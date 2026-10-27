@@ -294,6 +294,23 @@ autogroup_1 "/mnt/d/codes/work/** -> work"    // optional cwd-glob overrides, tr
 - `dir` — plain `basename $cwd` (lands in **General**) when no rule matches.
 - Only tabs still named `Tab #N` are renamed — name a tab manually and it stays yours.
 
+### Group by directory, whatever the tab is called
+
+A tab whose name has no `group:` prefix can join a group by where its first pane works
+(Zellij 0.44+ reports pane cwds to plugins). Rules are `glob -> group` lines, first match
+wins; `/**` matches the directory itself and everything below it:
+
+```text
+/home/me/Projects/hospice.by/** -> hospice.by
+```
+
+Put them in the file `vtabs-groups` in the plugin's cache dir
+(`~/.cache/zellij/file:<plugin path>/plugin_cache/vtabs-groups`; `#` starts a comment),
+or as `dirgroup_N "glob -> group"` keys in the layout's `plugin` block. The file is
+re-read on every tab switch and needs no layout change — a changed plugin block is a
+different plugin to Zellij, so key binds that message the old one would launch a new
+copy. Another tool can write the file too (e.g. a project tree kept elsewhere).
+
 ### Claude Code worktrees
 
 To have `claude -w fix-auth` label its tab with the worktree name (`repo:fix-auth`), add a

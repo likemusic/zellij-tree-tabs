@@ -57,6 +57,24 @@ fn parse_spinner(config: Option<&String>) -> Vec<String> {
 /// each session's save wipe the others' state.
 const STATE_FILE_PREFIX: &str = "/cache/vtabs-state-";
 
+/// Directory group rules kept outside the layout (local change): `glob ->
+/// group` lines, `#` comments — the same as the `dirgroup_N` config keys, which
+/// come first. A file because a changed plugin config block is a different
+/// plugin to Zellij (Alt+w would launch a new one), and because another tool
+/// (task-hub's project tree) can write it. Re-read with the state file.
+const GROUPS_FILE: &str = "/cache/vtabs-groups";
+
+fn parse_groups_file(s: &str) -> Vec<(String, String)> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let (pattern, group) = l.split_once(" -> ")?;
+            Some((pattern.trim().to_string(), group.trim().to_string()))
+        })
+        .collect()
+}
+
 
 /// One line in the Zellij log (`zellij.log`), prefixed `VTABS` so a watcher
 /// can follow clicks and hand-overs and tell when one went nowhere.
@@ -130,12 +148,13 @@ fn is_default_tab_name(name: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// `autogroup_N "glob -> group"` config keys, in numeric order.
-fn parse_autogroup_rules(configuration: &BTreeMap<String, String>) -> Vec<(String, String)> {
+/// `<prefix>N "glob -> group"` config keys (`autogroup_`, `dirgroup_`), in
+/// numeric order.
+fn parse_glob_rules(configuration: &BTreeMap<String, String>, prefix: &str) -> Vec<(String, String)> {
     let mut numbered: Vec<(u32, (String, String))> = configuration
         .iter()
         .filter_map(|(k, v)| {
-            let n: u32 = k.strip_prefix("autogroup_")?.parse().ok()?;
+            let n: u32 = k.strip_prefix(prefix)?.parse().ok()?;
             let (pattern, group) = v.split_once(" -> ")?;
             Some((n, (pattern.trim().to_string(), group.trim().to_string())))
         })
@@ -190,6 +209,16 @@ fn derive_auto_name(
         }
         (None, AutoDefault::Off) => None,
     }
+}
+
+/// Group of the first `dirgroup_N` rule matching `cwd` (the directory itself
+/// or anything below it for a `/**` pattern).
+fn dir_group<'a>(rules: &'a [(String, String)], cwd: &str) -> Option<&'a str> {
+    let cwd = cwd.trim_end_matches('/');
+    rules.iter().find_map(|(pattern, group)| {
+        (cwd == pattern.trim_end_matches("/**") || glob_match::glob_match(pattern, cwd))
+            .then_some(group.as_str())
+    })
 }
 
 /// Rollup priority for collapsed group headers: waiting > working > completed.
@@ -492,6 +521,14 @@ struct State {
     /// tab id -> name the sidebar gave it from its only pane's title; a tab whose
     /// name no longer matches was renamed by hand and is left alone
     auto_named: BTreeMap<usize, String>,
+    /// `dirgroup_N "glob -> group"` (local change): a tab whose name carries no
+    /// `group:` prefix joins the group of the first rule its working directory
+    /// matches — projects group by where they live, whatever the tab is called
+    dir_groups: Vec<(String, String)>,
+    dir_groups_config: Vec<(String, String)>,
+    /// working directory per tab position: of its first pane that has one
+    /// (refreshed with the titles, by the visible instance)
+    tab_cwd: BTreeMap<usize, String>,
 }
 
 enum RenameTarget {
@@ -533,12 +570,25 @@ impl State {
         }
     }
 
+    /// A tab's group and label: the name's `group:` prefix, else the
+    /// `dirgroup_N` rule its working directory matches, else General.
+    fn group_of_tab<'a>(&self, position: usize, base: &'a str) -> (String, &'a str) {
+        if base.contains(self.separator) {
+            return self.group_of(base);
+        }
+        let group = self.tab_cwd.get(&position).and_then(|cwd| dir_group(&self.dir_groups, cwd));
+        match group {
+            Some(g) => (g.to_string(), base),
+            None => self.group_of(base),
+        }
+    }
+
     /// Groups in first-appearance (tab position) order.
     fn appearance_groups(&self) -> Vec<String> {
         let mut out = Vec::new();
         for t in &self.tabs {
             let (_, base) = parse_attention(&t.name);
-            let (g, _) = self.group_of(base);
+            let (g, _) = self.group_of_tab(t.position, base);
             if !out.contains(&g) {
                 out.push(g);
             }
@@ -557,6 +607,11 @@ impl State {
     }
 
     fn load_state(&mut self) {
+        let mut groups = self.dir_groups_config.clone();
+        if let Ok(s) = std::fs::read_to_string(GROUPS_FILE) {
+            groups.extend(parse_groups_file(&s));
+        }
+        self.dir_groups = groups;
         let Some(path) = self.state_file() else {
             return;
         };
@@ -598,7 +653,7 @@ impl State {
         let mut groups: BTreeMap<String, Vec<TabItem>> = BTreeMap::new();
         for t in &self.tabs {
             let (attention, base) = parse_attention(&t.name);
-            let (g, label) = self.group_of(base);
+            let (g, label) = self.group_of_tab(t.position, base);
             groups.entry(g).or_default().push(TabItem {
                 position: t.position,
                 label: label.to_string(),
@@ -861,7 +916,31 @@ impl State {
                 }
             }
         }
+        changed |= self.refresh_tab_cwds();
         self.auto_name_tabs();
+        changed
+    }
+
+    /// Working directory of each tab (for `dirgroup_N`): its first pane that
+    /// reports one — a held pane of a restored session may not. True if any
+    /// changed. Skipped without rules: one host call per tab every refresh.
+    fn refresh_tab_cwds(&mut self) -> bool {
+        if self.dir_groups.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for (position, panes) in &self.tab_panes {
+            let cwd = panes.iter().find_map(|(id, _, _)| {
+                get_pane_cwd(PaneId::Terminal(*id)).ok().map(|p| p.to_string_lossy().into_owned())
+            });
+            if let Some(cwd) = cwd {
+                if self.tab_cwd.get(position) != Some(&cwd) {
+                    vlog!("tab cwd my_id={} tab={} cwd={} group={:?}", self.my_id, position, cwd, dir_group(&self.dir_groups, &cwd));
+                    self.tab_cwd.insert(*position, cwd);
+                    changed = true;
+                }
+            }
+        }
         changed
     }
 
@@ -1111,7 +1190,7 @@ impl State {
         }
         for t in &self.tabs {
             let (att, base) = parse_attention(&t.name);
-            let (g, label) = self.group_of(base);
+            let (g, label) = self.group_of_tab(t.position, base);
             if g != old {
                 continue;
             }
@@ -1133,7 +1212,7 @@ impl State {
             return;
         };
         let (att, base) = parse_attention(&t.name);
-        let (g, old_label) = self.group_of(base);
+        let (g, old_label) = self.group_of_tab(position, base);
         if new_label.is_empty() || new_label == old_label {
             return;
         }
@@ -1739,7 +1818,9 @@ impl ZellijPlugin for State {
             Some("dir") => AutoDefault::Dir,
             _ => AutoDefault::Off,
         };
-        self.autogroup_rules = parse_autogroup_rules(&configuration);
+        self.autogroup_rules = parse_glob_rules(&configuration, "autogroup_");
+        self.dir_groups_config = parse_glob_rules(&configuration, "dirgroup_");
+        self.dir_groups = self.dir_groups_config.clone();
         self.spinner = parse_spinner(configuration.get("spinner"));
         self.pinned = configuration.get("pinned").map(String::as_str) != Some("false");
         self.move_command = configuration
@@ -2411,6 +2492,21 @@ mod tests {
     }
 
     #[test]
+    fn groups_file_skips_comments_and_junk() {
+        let r = parse_groups_file("# x\n\n/a/** -> A\nbad line\n  /b -> B  \n");
+        assert_eq!(r, vec![("/a/**".to_string(), "A".to_string()), ("/b".to_string(), "B".to_string())]);
+    }
+
+    #[test]
+    fn dir_group_matches_dir_and_below() {
+        let rules = vec![("/home/u/Projects/hospice.by/**".to_string(), "hospice.by".to_string())];
+        assert_eq!(dir_group(&rules, "/home/u/Projects/hospice.by"), Some("hospice.by"));
+        assert_eq!(dir_group(&rules, "/home/u/Projects/hospice.by/SquirrelStock-sql"), Some("hospice.by"));
+        assert_eq!(dir_group(&rules, "/home/u/Projects/hospice.byx"), None);
+        assert_eq!(dir_group(&rules, "/home/u/Projects/custom.by"), None);
+    }
+
+    #[test]
     fn group_of_splits_and_defaults() {
         let s = State { separator: ':', ..Default::default() };
         assert_eq!(s.group_of("work:api"), ("work".to_string(), "api"));
@@ -2528,7 +2624,7 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            parse_autogroup_rules(&cfg),
+            parse_glob_rules(&cfg, "autogroup_"),
             vec![
                 ("/a/**".to_string(), "ay".to_string()),
                 ("/b/**".to_string(), "bee".to_string()),
