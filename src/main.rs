@@ -73,6 +73,11 @@ const WORKTREE_TICKS: u32 = 15;
 
 /// Unread panes (`pane_unread`), space-separated ids, one file per session.
 const UNREAD_FILE_PREFIX: &str = "/cache/vtabs-unread-";
+/// Worktree lists the visible instance last got from git, shared with the
+/// others: an instance shown with none drew the tree without its worktree
+/// rows, they popped in a moment later and moved the rows under the mouse.
+const PIN_FILE_PREFIX: &str = "/cache/vtabs-pin-";
+const WORKTREES_FILE_PREFIX: &str = "/cache/vtabs-worktrees-";
 
 fn parse_groups_file(s: &str) -> Vec<(String, String)> {
     s.lines()
@@ -620,6 +625,10 @@ struct State {
     pane_unread: BTreeSet<u32>,
     /// focused terminal pane of this instance's tab (from PaneUpdate)
     my_focused: Option<u32>,
+    /// tab whose row was clicked: its row stays selected (not its focused
+    /// pane's) until the focus moves to another pane — shared through
+    /// PIN_FILE_PREFIX with the instance of that tab, which shows next
+    pin_tab: Option<usize>,
     /// `git worktree list` per repo (local change): main worktree path -> its
     /// other worktrees (path, branch), and which repo each tab cwd is in
     worktrees: BTreeMap<String, Vec<(String, String)>>,
@@ -1064,8 +1073,8 @@ impl State {
                 }
                 if let Some(main) = main {
                     let before = rows.len();
-                    // depth + 3 puts the header's ▶ right of the panes' └ (see render)
-                    self.push_worktree_rows(&mut rows, &node.path, &main, node.depth + 3);
+                    // depth + 2 puts the header's ▶ right of the panes' └ (see render)
+                    self.push_worktree_rows(&mut rows, &node.path, &main, node.depth + 2);
                     // the header continues the tab's pane tree: its last pane is no longer last
                     if rows.len() > before {
                         if let Some(Row::Pane { last, .. }) = rows[..before].last_mut() {
@@ -1116,6 +1125,9 @@ impl State {
             return rows.iter().position(|r| matches!(r, Row::Pane { focused: true, .. }));
         }
         let tab = rows.iter().position(|r| matches!(r, Row::Tab { active: true, .. }))?;
+        if matches!(rows[tab], Row::Tab { position, .. } if Some(position) == self.pin_tab) {
+            return Some(tab);
+        }
         let pane = rows[tab + 1..]
             .iter()
             .take_while(|r| matches!(r, Row::Pane { .. }))
@@ -1375,6 +1387,40 @@ impl State {
             self.save_unread();
         }
         read
+    }
+
+    /// One line per tab cwd ("R cwd main") and per worktree ("W main path branch"), tab-separated.
+    fn save_worktrees(&self) {
+        let Some(session) = &self.session else { return };
+        let mut out = String::new();
+        for (cwd, main) in &self.cwd_repo {
+            out.push_str(&format!("R\t{}\t{}\n", cwd, main));
+        }
+        for (main, list) in &self.worktrees {
+            for (path, branch) in list {
+                out.push_str(&format!("W\t{}\t{}\t{}\n", main, path, branch));
+            }
+        }
+        let _ = std::fs::write(format!("{}{}", WORKTREES_FILE_PREFIX, session), out);
+    }
+
+    fn load_worktrees(&mut self) {
+        let Some(session) = &self.session else { return };
+        let Ok(s) = std::fs::read_to_string(format!("{}{}", WORKTREES_FILE_PREFIX, session)) else { return };
+        let (mut repos, mut lists): (BTreeMap<String, String>, BTreeMap<String, Vec<(String, String)>>) = Default::default();
+        for line in s.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.as_slice() {
+                ["R", cwd, main] => {
+                    repos.insert(cwd.to_string(), main.to_string());
+                    lists.entry(main.to_string()).or_default();
+                }
+                ["W", main, path, branch] => lists.entry(main.to_string()).or_default().push((path.to_string(), branch.to_string())),
+                _ => {}
+            }
+        }
+        self.cwd_repo = repos;
+        self.worktrees = lists;
     }
 
     fn unread_file(&self) -> Option<String> {
@@ -2277,6 +2323,11 @@ impl State {
         if self.keys_on {
             self.keys_off(false);
         }
+        self.pin_tab = target.1.is_none().then_some(target.0).flatten();
+        if let Some(session) = &self.session {
+            let pin = self.pin_tab.map(|p| p.to_string()).unwrap_or_default();
+            let _ = std::fs::write(format!("{}{}", PIN_FILE_PREFIX, session), pin);
+        }
         self.selected = idx;
         self.activate(idx);
     }
@@ -2310,9 +2361,9 @@ impl State {
                     }
                 } else if let Row::Tab { position, label, depth, attention, unread, fold: Some(folded), .. } = &rows[idx] {
                     // the ▼/▶ before the label folds the tab's panes and worktrees
-                    let slot = self.state_slot(*attention, *unread, self.tab_background(*position));
-                    let mark = LEFT_PAD + 2 * depth + 4 + visible_width(&slot);
-                    if col == mark || col == mark + 1 {
+                    let _ = (position, attention, unread);
+                    let mark = LEFT_PAD + 2 * depth + 2;
+                    if col == mark || col == mark + 1 && self.width_saved.is_none() {
                         let key = tab_fold_key(label);
                         self.set_folded(&key, !folded);
                     } else {
@@ -2630,9 +2681,13 @@ impl ZellijPlugin for State {
                     }
                 }
                 self.sync_width(false);
+                let was_focused = self.my_focused;
                 self.my_focused = self.my_tab.and_then(|t| manifest.panes.get(&t)).and_then(|ps| {
                     ps.iter().find(|p| !p.is_plugin && p.is_focused && !p.is_suppressed).map(|p| p.id)
                 });
+                if !self.hidden && was_focused.is_some() && was_focused != self.my_focused {
+                    self.pin_tab = None;
+                }
                 let read = self.mark_focused_read();
                 // Outside keyboard mode the bar follows pane focus (Alt+arrows, clicks,
                 // Enter on a pane row) — TabUpdate does not fire for a pane-only change.
@@ -2699,6 +2754,20 @@ impl ZellijPlugin for State {
                         self.update(Event::TabUpdate(me.tabs));
                         self.update(Event::PaneUpdate(me.panes));
                     }
+                    self.load_worktrees();
+                    // a click on this tab's row in the sidebar shown before (read once)
+                    if let Some(file) = self.session.as_ref().map(|s| format!("{}{}", PIN_FILE_PREFIX, s)) {
+                        self.pin_tab = std::fs::read_to_string(&file)
+                            .ok()
+                            .and_then(|p| p.trim().parse().ok())
+                            .filter(|p| Some(*p) == self.my_tab);
+                        let _ = std::fs::remove_file(&file);
+                    }
+                    if !self.keys_on && self.pending_pane.is_none() {
+                        if let Some(i) = self.active_row_index() {
+                            self.selected = i;
+                        }
+                    }
                     self.refresh_titles();
                     // misses counted while hidden say nothing about this width
                     self.width_stuck = None;
@@ -2717,7 +2786,11 @@ impl ZellijPlugin for State {
                 let Some(cwd) = ctx.get("cwd").cloned() else { return false };
                 let list = if exit == Some(0) { parse_worktrees(&String::from_utf8_lossy(&stdout)) } else { Vec::new() };
                 let Some(((main, _), rest)) = list.split_first() else {
-                    return self.cwd_repo.remove(&cwd).is_some() && !self.hidden;
+                    let gone = self.cwd_repo.remove(&cwd).is_some();
+                    if gone && !self.hidden {
+                        self.save_worktrees();
+                    }
+                    return gone && !self.hidden;
                 };
                 let changed = self.cwd_repo.get(&cwd) != Some(main) || self.worktrees.get(main).map(Vec::as_slice) != Some(rest);
                 if changed {
@@ -2725,6 +2798,9 @@ impl ZellijPlugin for State {
                 }
                 self.cwd_repo.insert(cwd, main.clone());
                 self.worktrees.insert(main.clone(), rest.to_vec());
+                if changed && !self.hidden {
+                    self.save_worktrees();
+                }
                 changed && !self.hidden
             }
             Event::Key(key) => self.handle_key(key),
@@ -2925,26 +3001,27 @@ impl ZellijPlugin for State {
                             format!("{}{} {}▏", indent, disc, buf)
                         } else if name.contains('⎇') {
                             // last branch of the tab's pane tree, ▶/▼ still at 2 * depth
-                            let indent = "  ".repeat(depth.saturating_sub(3));
-                            format!("{}    \u{1b}[2m└\u{1b}[22m {} {} ({})", indent, disc, label, count)
+                            let indent = "  ".repeat(depth.saturating_sub(2));
+                            format!("{}  \u{1b}[2m└\u{1b}[22m {} {} ({})", indent, disc, label, count)
                         } else {
                             let icon = if *collapsed { self.icon(*attention, *unread) } else { String::new() };
                             format!("{}{} {}{} ({})", indent, disc, icon, label, count)
                         }
                     }
                     Row::Tab { position, label, depth, active, attention, unread, fold } => {
+                        // ▼/▶ one level in from the group's, like a subgroup's; the
+                        // active tab's ● goes into the left margin (see below)
+                        let _ = active;
                         let indent = "  ".repeat(*depth);
-                        let dot = if *active { "●" } else { " " };
-                        let label = format!("{}{}", fold_mark(*fold), label);
                         let editing = match &self.renaming {
                             Some((RenameTarget::Tab(p), buf)) if p == position => Some(buf),
                             _ => None,
                         };
                         if let Some(buf) = editing {
-                            format!("{}  {} {}{}▏", indent, dot, fold_mark(*fold), buf)
+                            format!("{}  {}{}▏", indent, fold_mark(*fold), buf)
                         } else {
                             let slot = self.state_slot(*attention, *unread, self.tab_background(*position));
-                            format!("{}  {} {}{}", indent, dot, slot, label)
+                            format!("{}  {}{}{}", indent, fold_mark(*fold), slot, label)
                         }
                     }
                     Row::Pane { id, title, depth, focused, last, flat, attention, unread } => {
@@ -2956,14 +3033,18 @@ impl ZellijPlugin for State {
                             let dot = if *focused { "●" } else { " " };
                             format!("  {} {}{}", dot, icon, title)
                         } else if *focused {
-                            format!("{}    {} {}{}", indent, branch, icon, title)
+                            format!("{}  {} {}{}", indent, branch, icon, title)
                         } else {
-                            format!("{}    \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", indent, branch, icon, title)
+                            format!("{}  \u{1b}[2m{} \u{1b}[22m{}\u{1b}[2m{}\u{1b}[22m", indent, branch, icon, title)
                         }
                     }
                 }
             };
-            let pad = if narrow { "" } else { pad.as_str() };
+            let pad = match row {
+                _ if narrow => "",
+                Row::Tab { active: true, .. } => "●",
+                _ => pad.as_str(),
+            };
             let line = truncate_visible(&format!("{}{}", pad, core), cols);
             if i == self.selected {
                 let w = visible_width(&line);
