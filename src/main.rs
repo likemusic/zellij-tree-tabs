@@ -582,10 +582,11 @@ struct State {
     /// grouped by attention state instead of by name prefix; saved in the state
     /// file so every tab's instance shows the same view
     status_view: bool,
-    /// sidebar width (local change, `-` `=` `0` keys): every instance resizes its
-    /// own pane toward `width` — also after a swap layout reset it to the
-    /// layout's size. Zellij resizes in steps (a percentage of the tab), so the
-    /// width lands on the step closest to the target.
+    /// sidebar width (local change, `-` `=` `0` keys): a target this instance
+    /// resizes its own pane toward, cleared once reached. Each tab keeps its
+    /// own width (the user's choice): Zellij resizes in steps of 5% of the tab
+    /// and a hidden tab's resize is dropped, so a shared width jumped on every
+    /// tab switch, and one set with the mouse was out of the others' reach.
     width: Option<usize>,
     width_saved: Option<usize>,
     /// own pane's columns, the full tab width, and the terminal pane right of
@@ -599,10 +600,6 @@ struct State {
     resize_step: usize,
     /// own width as of the last tick (see sync_width)
     cols_settled: usize,
-    /// (own columns, full tab width) at which sync_width last had nothing to
-    /// do: a settled width away from it, with no resize of ours in flight, is
-    /// the user's — a border dragged with the mouse or resize mode
-    rest_cols: Option<(usize, usize)>,
     width_stuck: Option<(usize, bool)>,
     /// (tab id, name) of leftover marks already stripped: PaneUpdates keep
     /// coming before the TabUpdate with the new name, don't rename again
@@ -763,13 +760,6 @@ impl State {
             if let Some(v) = p.status_view {
                 self.status_view = v;
             }
-            if p.width != self.width {
-                self.width = p.width;
-                self.width_stuck = None;
-                self.resize_misses = 0;
-                self.last_resize = None;
-            }
-            self.width_saved = p.width_saved;
         }
     }
 
@@ -782,8 +772,9 @@ impl State {
             collapsed: self.collapsed.clone(),
             tab_order: self.tab_order.clone(),
             status_view: Some(self.status_view),
-            width: self.width,
-            width_saved: self.width_saved,
+            // per tab now: an old shared width is dropped on the next save
+            width: None,
+            width_saved: None,
         };
         let _ = std::fs::write(path, serialize_state(&p));
     }
@@ -1793,7 +1784,7 @@ impl State {
         }
     }
 
-    /// One step narrower/wider; the new target is saved for every tab's sidebar.
+    /// One step narrower/wider, in this tab only.
     fn change_width(&mut self, wider: bool) -> bool {
         if self.my_cols == 0 {
             return false;
@@ -1884,27 +1875,25 @@ impl State {
         if c != self.cols_settled {
             return;
         }
-        if self.last_resize.is_none() && self.adopt_user_width(c) {
-            return;
-        }
         let step = self.step_cols();
         let increase = if c < target && (c + step).abs_diff(target) < target - c {
             true
         } else if c > target && c.saturating_sub(step).abs_diff(target) < c - target {
             false
         } else {
-            self.rest_cols = Some((c, self.full_cols));
+            // as close as the resize steps get: done, the border is the user's
+            // again (a mouse drag stays)
+            self.width = None;
             return;
         };
         if self.width_stuck == Some((c, increase)) {
-            self.rest_cols = Some((c, self.full_cols));
+            self.width = None;
             return;
         }
         let Some(neighbor) = self.neighbor else {
-            self.rest_cols = Some((c, self.full_cols));
+            self.width = None;
             return;
         };
-        self.rest_cols = None;
         vlog!("width resize my_id={} cols={} target={} step={} increase={} neighbor={}", self.my_id, c, target, step, increase, neighbor);
         // the neighbour gives up (or takes) columns on its left edge
         let resize = if increase { Resize::Decrease } else { Resize::Increase };
@@ -1913,34 +1902,6 @@ impl State {
             PaneId::Terminal(neighbor),
         );
         self.last_resize = Some((c, increase, 0));
-    }
-
-    /// The sidebar's border was moved by hand (mouse drag, resize mode) while
-    /// it sat at rest: make that width the target of every tab's sidebar
-    /// instead of pulling it back. Not after a tab switch (`rest_cols` is reset
-    /// on Visible: the shown width is a stale one) and not when the whole tab
-    /// changed width (the terminal window was resized). True if adopted.
-    fn adopt_user_width(&mut self, c: usize) -> bool {
-        let Some((rest, full)) = self.rest_cols else { return false };
-        if rest == c || full != self.full_cols {
-            if full != self.full_cols {
-                self.rest_cols = None;
-            }
-            return false;
-        }
-        // a relayout that settled on a huge width (fullscreen, a lost swap
-        // layout) is not a width anyone picked
-        if self.full_cols > 0 && c * 3 > self.full_cols * 2 {
-            return false;
-        }
-        vlog!("width adopt my_id={} cols={} was={} target={:?}", self.my_id, c, rest, self.width);
-        self.width = Some(c);
-        self.width_saved = None;
-        self.width_stuck = None;
-        self.resize_misses = 0;
-        self.rest_cols = Some((c, self.full_cols));
-        self.save_state();
-        true
     }
 
     /// Switch project/status view, keeping the selection on the same tab or pane.
@@ -2151,7 +2112,6 @@ impl ZellijPlugin for State {
                 // every tab switch fires a TabUpdate, so the visible sidebar
                 // is always freshly synced.
                 self.load_state();
-                // a width set in another tab's sidebar
                 self.sync_width(false);
                 if self.focus_on_show
                     && self.tabs.iter().any(|t| t.active && Some(t.position) == self.my_tab)
@@ -2382,7 +2342,6 @@ impl ZellijPlugin for State {
                     self.width_stuck = None;
                     self.resize_misses = 0;
                     self.last_resize = None;
-                    self.rest_cols = None;
                     self.sync_width(false);
                 }
                 self.ensure_timer();
