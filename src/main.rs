@@ -25,7 +25,10 @@ const MARK_WORKING: &str = "⚙ ";
 /// which sits visibly high-and-left next to ◆/✓. Override with the `spinner`
 /// config key (each char = one frame; width-1 glyphs only).
 const SPINNER_DEFAULT: &str = "⣾⣽⣻⢿⡿⣟⣯⣷";
-const SPINNER_INTERVAL: f64 = 0.15;
+/// 2 frames a second (local change, was 0.15 s): each frame is a full render
+/// of the pane, and at ~7 a second the sidebar and Zellij's screen thread took
+/// a quarter of a core.
+const SPINNER_INTERVAL: f64 = 0.5;
 /// Pane titles set by programs (OSC, e.g. Claude Code) don't trigger a
 /// PaneUpdate, so the visible sidebar re-reads them this often (seconds).
 const TITLE_INTERVAL: f64 = 2.0;
@@ -63,6 +66,9 @@ const STATE_FILE_PREFIX: &str = "/cache/vtabs-state-";
 /// plugin to Zellij (Alt+w would launch a new one), and because another tool
 /// (task-hub's project tree) can write it. Re-read with the state file.
 const GROUPS_FILE: &str = "/cache/vtabs-groups";
+
+/// Unread panes (`pane_unread`), space-separated ids, one file per session.
+const UNREAD_FILE_PREFIX: &str = "/cache/vtabs-unread-";
 
 fn parse_groups_file(s: &str) -> Vec<(String, String)> {
     s.lines()
@@ -567,8 +573,14 @@ struct State {
     pane_attention: BTreeMap<u32, Attention>,
     /// panes whose session finished its turn (or asked) while you were
     /// elsewhere (local change), until you focus them — Zellij's `[!]`, kept
-    /// per pane: their ✓ is drawn bright, a read one dim
+    /// per pane: their ✓ is drawn bright, a read one dim. Kept by the visible
+    /// instance (it knows the focus from PaneUpdate, no host call) in
+    /// UNREAD_FILE_PREFIX, read back by an instance when it is shown.
     pane_unread: BTreeSet<u32>,
+    /// focused terminal pane of this instance's tab (from PaneUpdate)
+    my_focused: Option<u32>,
+    /// tab_group_paths' last result and the hash of what it was computed from
+    group_paths_cache: std::cell::RefCell<Option<(u64, BTreeMap<usize, String>)>>,
     /// per-pane background work of its Claude session (local change, from
     /// vtabs-bg.sh): shell commands and monitors still running, so a finished
     /// turn that waits on them reads apart from an idle one
@@ -693,6 +705,28 @@ impl State {
     /// else the `dirgroup_N` rule its working directory matches (directory
     /// levels with a single tab folded away), else General.
     fn tab_group_paths(&self) -> BTreeMap<usize, String> {
+        // memoized (local change): every render rebuilds the rows, ~7 times a
+        // second while a spinner turns, and the plugin runs interpreted
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for t in &self.tabs {
+            (t.position, &t.name).hash(&mut h);
+        }
+        self.tab_cwd.hash(&mut h);
+        self.dir_groups.hash(&mut h);
+        self.separator.hash(&mut h);
+        let key = h.finish();
+        if let Some((k, paths)) = &*self.group_paths_cache.borrow() {
+            if *k == key {
+                return paths.clone();
+            }
+        }
+        let paths = self.compute_tab_group_paths();
+        *self.group_paths_cache.borrow_mut() = Some((key, paths.clone()));
+        paths
+    }
+
+    fn compute_tab_group_paths(&self) -> BTreeMap<usize, String> {
         let raw: Vec<(usize, (Vec<String>, usize))> = self
             .tabs
             .iter()
@@ -1165,8 +1199,16 @@ impl State {
     /// from the cache (ids are stable); name and active flags are queried live,
     /// so any number of instances can handle the same pipe idempotently — which
     /// is also required, because no single instance reliably receives pipes.
+    ///
+    /// Two instances do it (local change): the visible one and the one in the
+    /// pane's own tab — the query is a blocking host call, and all ~10
+    /// instances making it on every signal slowed the server (CLI pipes timed
+    /// out). Two still cover a pipe that one of them misses.
     fn fresh_tab(&self, pane_id: u32) -> Option<TabInfo> {
         let tab_pos = *self.pane_tab.get(&pane_id)?;
+        if self.hidden && self.my_tab != Some(tab_pos) {
+            return None;
+        }
         let tab_id = self.tabs.iter().find(|t| t.position == tab_pos)?.tab_id;
         get_tab_info(tab_id)
     }
@@ -1217,15 +1259,37 @@ impl State {
         new != old
     }
 
-    /// The pane you are in is read (local change): drop its unread mark. One
-    /// host call, only while something is unread. True if it changed.
+    /// The pane you are in is read (local change): drop its unread mark. Only
+    /// the visible instance knows where you are; it saves the change for the
+    /// others. True if it changed.
     fn mark_focused_read(&mut self) -> bool {
-        if self.pane_unread.is_empty() {
+        if self.hidden {
             return false;
         }
-        match get_focused_pane_info() {
-            Ok((_, PaneId::Terminal(f))) => self.pane_unread.remove(&f),
-            _ => false,
+        let read = self.my_focused.is_some_and(|f| self.pane_unread.remove(&f));
+        if read {
+            self.save_unread();
+        }
+        read
+    }
+
+    fn unread_file(&self) -> Option<String> {
+        self.session.as_ref().map(|s| format!("{}{}", UNREAD_FILE_PREFIX, s))
+    }
+
+    fn save_unread(&self) {
+        if self.hidden {
+            return;
+        }
+        if let Some(path) = self.unread_file() {
+            let ids: Vec<String> = self.pane_unread.iter().map(u32::to_string).collect();
+            let _ = std::fs::write(path, ids.join(" "));
+        }
+    }
+
+    fn load_unread(&mut self) {
+        if let Some(s) = self.unread_file().and_then(|p| std::fs::read_to_string(p).ok()) {
+            self.pane_unread = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
         }
     }
 
@@ -1241,6 +1305,9 @@ impl State {
         let a = self.pane_attention.remove(&id).is_some();
         let b = self.pane_background.remove(&id).is_some();
         let c = self.pane_unread.remove(&id);
+        if c {
+            self.save_unread();
+        }
         a || b || c
     }
 
@@ -2339,9 +2406,16 @@ impl ZellijPlugin for State {
                     }
                 }
                 self.sync_width(false);
+                self.my_focused = self.my_tab.and_then(|t| manifest.panes.get(&t)).and_then(|ps| {
+                    ps.iter().find(|p| !p.is_plugin && p.is_focused && !p.is_suppressed).map(|p| p.id)
+                });
                 let read = self.mark_focused_read();
                 // Outside keyboard mode the bar follows pane focus (Alt+arrows, clicks,
                 // Enter on a pane row) — TabUpdate does not fire for a pane-only change.
+                // hidden: rows are rebuilt when shown (Visible), not on every update
+                if self.hidden && !self.keys_on {
+                    return false;
+                }
                 if !self.keys_on && self.pending_pane.is_none() {
                     if let Some(i) = self.active_row_index() {
                         if i != self.selected {
@@ -2378,6 +2452,17 @@ impl ZellijPlugin for State {
             }
             Event::Visible(visible) => {
                 self.hidden = !visible;
+                // Hidden instances stop taking the full pane list and session
+                // list (local change): Zellij sends both to every instance on
+                // any change — a working Claude animates its pane title — and
+                // ~10 hidden sidebars decoding them kept the server busy. Shown
+                // again, the subscription brings a fresh PaneUpdate.
+                let heavy = [EventType::PaneUpdate, EventType::SessionUpdate];
+                if visible {
+                    subscribe(&heavy);
+                } else {
+                    unsubscribe(&heavy);
+                }
                 // shown again: catch up on titles and the spinner right away
                 if visible {
                     self.refresh_titles();
@@ -2386,6 +2471,8 @@ impl ZellijPlugin for State {
                     self.resize_misses = 0;
                     self.last_resize = None;
                     self.sync_width(false);
+                    self.load_unread();
+                    self.mark_focused_read();
                 }
                 self.ensure_timer();
                 visible
@@ -2474,31 +2561,47 @@ impl ZellijPlugin for State {
                         if payload.trim().is_empty() {
                             return false;
                         }
-                        return self.set_pane_background(pane_id, payload);
+                        // hidden: keep the state, draw nothing
+                        return self.set_pane_background(pane_id, payload) && !self.hidden;
                     }
                     if parts[0] == "clear-working" {
                         self.pane_background.remove(&pane_id);
                     }
                     // the status view regroups rows on a state change — keep the
                     // selection on the same row, not the same index
-                    let keep = self.selected_key();
+                    let keep = (!self.hidden).then(|| self.selected_key());
                     let mut pane_changed = self.set_pane_attention(pane_id, parts[0]);
                     match parts[0] {
                         "completed" | "waiting" => {
-                            let looking = matches!(get_focused_pane_info(), Ok((_, PaneId::Terminal(f))) if f == pane_id);
-                            if !looking {
-                                pane_changed |= self.pane_unread.insert(pane_id);
+                            // a hidden instance can't tell; it re-reads the visible one's file when shown
+                            let looking = !self.hidden && self.my_focused == Some(pane_id);
+                            if !looking && self.pane_unread.insert(pane_id) {
+                                pane_changed = true;
+                                self.save_unread();
                             }
                         }
                         // you answered (the session works again) or it ended
-                        "working" | "clear-working" => pane_changed |= self.pane_unread.remove(&pane_id),
+                        "working" | "clear-working" => {
+                            if self.pane_unread.remove(&pane_id) {
+                                pane_changed = true;
+                                self.save_unread();
+                            }
+                        }
                         // marks restored from outside (after a plugin reload) are not news
-                        "read" => return self.pane_unread.remove(&pane_id),
+                        "read" => {
+                            let changed = self.pane_unread.remove(&pane_id);
+                            if changed {
+                                self.save_unread();
+                            }
+                            return changed;
+                        }
                         _ => {}
                     }
-                    if pane_changed {
+                    if let (true, Some(keep)) = (pane_changed, keep) {
                         self.reselect(keep);
                     }
+                    // a hidden instance only keeps the state: nothing to draw
+                    let pane_changed = pane_changed && !self.hidden;
                     match parts[0] {
                         "waiting" => {
                             self.set_attention(pane_id, Attention::Waiting);
