@@ -29,6 +29,8 @@ const SPINNER_INTERVAL: f64 = 0.15;
 /// Pane titles set by programs (OSC, e.g. Claude Code) don't trigger a
 /// PaneUpdate, so the visible sidebar re-reads them this often (seconds).
 const TITLE_INTERVAL: f64 = 2.0;
+/// title ticks to wait for a resize to land before counting it lost
+const RESIZE_WAIT_TICKS: u8 = 2;
 
 /// Each char of the `spinner` config value is one animation frame.
 fn parse_spinner(config: Option<&String>) -> Vec<String> {
@@ -55,6 +57,12 @@ fn parse_spinner(config: Option<&String>) -> Vec<String> {
 /// each session's save wipe the others' state.
 const STATE_FILE_PREFIX: &str = "/cache/vtabs-state-";
 
+
+/// One line in the Zellij log (`zellij.log`), prefixed `VTABS` so a watcher
+/// can follow clicks and hand-overs and tell when one went nowhere.
+macro_rules! vlog {
+    ($($arg:tt)*) => { eprintln!("VTABS {}", format!($($arg)*)) };
+}
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Attention {
     Waiting,
@@ -414,6 +422,13 @@ struct State {
     pane_background: BTreeMap<u32, (u16, u16)>,
     /// terminal panes collapsed in a stack (Zellij reports them as suppressed)
     stacked_collapsed: BTreeSet<u32>,
+    /// a collapsed stacked pane being unfolded by a focus round trip: its own
+    /// focus may show up in a PaneUpdate after the sidebar got it back
+    expanding: Option<u32>,
+    /// this instance's tab is not the shown one (Event::Visible): it neither
+    /// animates nor refreshes titles — ten sidebars spinning at 0.15 s kept
+    /// the server's plugin threads busy for one picture on screen
+    hidden: bool,
     /// status view (local change, `v` key / `default_view` config key): tabs
     /// grouped by attention state instead of by name prefix; saved in the state
     /// file so every tab's instance shows the same view
@@ -429,10 +444,12 @@ struct State {
     my_cols: usize,
     full_cols: usize,
     neighbor: Option<u32>,
-    /// last resize issued: (columns before, increase); observed step size;
+    /// last resize issued: (columns before, increase, ticks waited); observed step size;
     /// columns and direction in which a resize had no effect (not retried)
-    last_resize: Option<(usize, bool)>,
+    last_resize: Option<(usize, bool, u8)>,
     resize_step: usize,
+    /// own width as of the last tick (see sync_width)
+    cols_settled: usize,
     width_stuck: Option<(usize, bool)>,
     /// resizes in a row that had no effect — one sent while a swap layout is
     /// being applied gets lost, so give up only after a few
@@ -805,7 +822,8 @@ impl State {
     /// Arm the animation timer if something is working and none is scheduled.
     fn ensure_timer(&mut self) {
         if !self.timer_running {
-            self.timer_interval = if self.any_working() { SPINNER_INTERVAL } else { TITLE_INTERVAL };
+            self.timer_interval =
+                if !self.hidden && self.any_working() { SPINNER_INTERVAL } else { TITLE_INTERVAL };
             set_timeout(self.timer_interval);
             self.timer_running = true;
         }
@@ -813,12 +831,7 @@ impl State {
 
     /// Re-read pane titles if this instance is the visible one; true if any changed.
     fn refresh_titles(&mut self) -> bool {
-        let visible = match get_focused_pane_info() {
-            Ok((_, PaneId::Terminal(id))) => self.pane_tab.get(&id) == self.my_tab.as_ref(),
-            Ok((_, PaneId::Plugin(id))) => self.plugin_tab.get(&id) == self.my_tab.as_ref(),
-            Err(_) => false,
-        };
-        if !visible {
+        if self.hidden {
             return false;
         }
         let mut changed = false;
@@ -1177,6 +1190,7 @@ impl State {
         let Some(id) = pane.filter(|id| self.stacked_collapsed.contains(id)) else { return };
         // the round trip must not read as "focus left the sidebar"
         self.keys_focus_seen = false;
+        self.expanding = Some(id);
         focus_terminal_pane(id, false, false);
         focus_plugin_pane(self.my_id, false, false);
     }
@@ -1194,6 +1208,7 @@ impl State {
     }
 
     fn keys_on_here(&mut self, origin: Option<usize>) {
+        vlog!("keys_on my_id={} my_tab={:?} origin={:?}", self.my_id, self.my_tab, origin);
         self.keys_on = true;
         self.keys_focus_seen = false;
         self.keys_origin = origin;
@@ -1255,9 +1270,11 @@ impl State {
     }
 
     fn keys_off(&mut self, restore_focus: bool) {
+        vlog!("keys_off my_id={} my_tab={:?} restore={}", self.my_id, self.my_tab, restore_focus);
         self.keys_on = false;
         self.focus_on_show = false;
         self.keys_focus_seen = false;
+        self.expanding = None;
         self.pending_pane = None;
         self.highlight(None);
         if self.pinned {
@@ -1472,26 +1489,52 @@ impl State {
     /// landed at once.
     fn sync_width(&mut self, tick: bool) {
         let (Some(target), c) = (self.width, self.my_cols) else { return };
-        if c == 0 {
+        // a hidden tab's resize is dropped by Zellij and its misses would mark
+        // the width stuck for good: each sidebar catches up when it is shown
+        if c == 0 || self.hidden {
             return;
         }
-        if let Some((before, increase)) = self.last_resize {
+        if let Some((before, increase, waited)) = self.last_resize {
             if c != before {
                 self.last_resize = None;
                 self.resize_misses = 0;
-                self.resize_step = c.abs_diff(before);
+                // a step that took longer than one tick may have landed together
+                // with a retry: its size is not one step
+                if waited == 0 {
+                    self.resize_step = c.abs_diff(before);
+                }
             } else if !tick {
                 return; // still in flight
+            } else if waited < RESIZE_WAIT_TICKS {
+                // a busy server applies a resize seconds late: resending now
+                // queues a second one and both land together, overshooting
+                self.last_resize = Some((before, increase, waited + 1));
+                return;
             } else {
-                // no effect by the next tick: lost in a relayout, a fixed-size
+                // no effect for several ticks: lost in a relayout, a fixed-size
                 // pane, or the minimum width — retry a few times, then give up
                 // at this width until it or the target changes
                 self.last_resize = None;
                 self.resize_misses += 1;
                 if self.resize_misses >= 3 {
                     self.width_stuck = Some((c, increase));
+                    vlog!("width stuck my_id={} cols={} target={} increase={}", self.my_id, c, target, increase);
                 }
             }
+        } else if self.width_stuck.is_some_and(|(w, _)| w != c) {
+            // the width moved on its own (a late resize, a relayout): not stuck here
+            self.width_stuck = None;
+            self.resize_misses = 0;
+        }
+        // act only on a width that held since the last tick: a relayout (focus
+        // moving onto the sidebar, a swap layout) passes through widths for a
+        // moment, and a resize sent then lands on the settled width
+        if tick && c != self.cols_settled {
+            self.cols_settled = c;
+            return;
+        }
+        if c != self.cols_settled {
+            return;
         }
         let step = self.step_cols();
         let increase = if c < target && (c + step).abs_diff(target) < target - c {
@@ -1505,13 +1548,14 @@ impl State {
             return;
         }
         let Some(neighbor) = self.neighbor else { return };
+        vlog!("width resize my_id={} cols={} target={} step={} increase={} neighbor={}", self.my_id, c, target, step, increase, neighbor);
         // the neighbour gives up (or takes) columns on its left edge
         let resize = if increase { Resize::Decrease } else { Resize::Increase };
         resize_pane_with_id(
             ResizeStrategy { resize, direction: Some(Direction::Left), invert_on_boundaries: false },
             PaneId::Terminal(neighbor),
         );
-        self.last_resize = Some((c, increase));
+        self.last_resize = Some((c, increase, 0));
     }
 
     /// Switch project/status view, keeping the selection on the same tab or pane.
@@ -1546,28 +1590,33 @@ impl State {
             .min(rows.len().saturating_sub(1));
     }
 
-    /// A click on a tab or pane row (local change) enters keyboard mode on that
-    /// row instead of focusing it: the tab is shown, a pane's frame highlighted,
-    /// and the arrows go on from there; Enter focuses, Esc stays in that tab.
+    /// A click on a tab or pane row goes there (local change), done by the
+    /// clicked instance itself: it is the visible one, so its tab positions are
+    /// fresh. Handing the click over to the target tab's instance (keyboard mode
+    /// on click) relied on a hidden instance's idea of its own tab, which goes
+    /// stale, and clicks onto some tabs did nothing. Zellij moves to the tab of a
+    /// focused pane and unfolds its stack; the selection then follows the focus.
     fn click_row(&mut self, rows: &[Row], idx: usize) {
-        let (tab, pane) = match &rows[idx] {
+        let target = match &rows[idx] {
             Row::Tab { position, .. } => (Some(*position), None),
             Row::Pane { id, .. } => (self.pane_tab.get(id).copied(), Some(*id)),
             Row::Group { .. } => return,
         };
-        let Some(tab) = tab else { return };
-        self.selected = idx;
-        if Some(tab) == self.my_tab {
-            if !self.keys_on {
-                self.keys_on_here(Some(tab));
-            }
-            self.highlight(pane);
-            self.expand_if_stacked(pane);
-        } else {
-            // the clicked tab is where Esc returns to
-            self.keys_origin = Some(tab);
-            self.browse_to(tab, pane);
+        vlog!(
+            "click my_id={} my_tab={:?} row={} tab={:?} tab_id={:?} pane={:?} keys_on={}",
+            self.my_id,
+            self.my_tab,
+            idx,
+            target.0,
+            target.0.and_then(|p| self.tabs.iter().find(|t| t.position == p)).map(|t| t.tab_id),
+            target.1,
+            self.keys_on
+        );
+        if self.keys_on {
+            self.keys_off(false);
         }
+        self.selected = idx;
+        self.activate(idx);
     }
 
     fn handle_mouse(&mut self, mouse: Mouse) -> bool {
@@ -1670,6 +1719,7 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult,
             EventType::SessionUpdate,
             EventType::PaneClosed,
+            EventType::Visible,
         ]);
         self.ensure_timer();
     }
@@ -1757,7 +1807,7 @@ impl ZellijPlugin for State {
                 }
                 self.timer_running = false;
                 let mut redraw = false;
-                if self.any_working() {
+                if !self.hidden && self.any_working() {
                     self.spin = self.spin.wrapping_add(1);
                     redraw = true;
                 }
@@ -1774,6 +1824,7 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(manifest) => {
                 self.pane_tab.clear();
                 let mut me_focused = false;
+                let mut focused_terminal = None;
                 let my_url = manifest
                     .panes
                     .values()
@@ -1806,11 +1857,21 @@ impl ZellijPlugin for State {
                     for p in panes {
                         if !p.is_plugin {
                             self.pane_tab.insert(p.id, *tab_pos);
+                            if p.is_focused && !p.is_floating {
+                                focused_terminal.get_or_insert((*tab_pos, p.id));
+                            }
                         } else {
                             self.plugin_tab.insert(p.id, *tab_pos);
                             if p.id == self.my_id {
                                 self.my_tab = Some(*tab_pos);
                                 me_focused = p.is_focused;
+                                if p.pane_columns != self.my_cols {
+                                    vlog!(
+                                        "cols my_id={} tab={} {} -> {} x={} floating={} suppressed={} fullscreen={} full={}",
+                                        self.my_id, tab_pos, self.my_cols, p.pane_columns, p.pane_x,
+                                        p.is_floating, p.is_suppressed, p.is_fullscreen, self.full_cols
+                                    );
+                                }
                                 self.my_cols = p.pane_columns;
                             }
                             if p.plugin_url.as_deref() == Some("zellij:tab-bar") {
@@ -1874,8 +1935,17 @@ impl ZellijPlugin for State {
                     // plugin ids are unique per instance, so the pane alone identifies us
                     let me_focused = me_focused
                         && matches!(get_focused_pane_info(), Ok((_, PaneId::Plugin(id))) if id == self.my_id);
+                    let expanding = self.expanding.filter(|id| {
+                        focused_terminal.is_some_and(|(t, f)| Some(t) == self.my_tab && f == *id)
+                    });
                     if me_focused {
                         self.keys_focus_seen = true;
+                        // unfolded and back in the sidebar: the round trip is over
+                        if self.expanding.is_some_and(|id| !self.stacked_collapsed.contains(&id)) {
+                            self.expanding = None;
+                        }
+                    } else if expanding.is_some() {
+                        // the stacked pane's own focus, arriving late: not a click elsewhere
                     } else if self.keys_focus_seen {
                         // focus left (click elsewhere, Alt+arrow): pin again, keep focus where it went
                         self.keys_off(false);
@@ -1883,6 +1953,20 @@ impl ZellijPlugin for State {
                     }
                 }
                 false
+            }
+            Event::Visible(visible) => {
+                self.hidden = !visible;
+                // shown again: catch up on titles and the spinner right away
+                if visible {
+                    self.refresh_titles();
+                    // misses counted while hidden say nothing about this width
+                    self.width_stuck = None;
+                    self.resize_misses = 0;
+                    self.last_resize = None;
+                    self.sync_width(false);
+                }
+                self.ensure_timer();
+                visible
             }
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -1901,8 +1985,20 @@ impl ZellijPlugin for State {
             let Ok((_, PaneId::Terminal(focused))) = get_focused_pane_info() else {
                 return false;
             };
-            if self.pane_tab.get(&focused) == self.my_tab.as_ref() && !self.keys_on {
+            // an instance that has not learned its tab yet (no PaneUpdate since a
+            // reload) also misses the focused pane: None == None took the keys in
+            // several tabs at once and showed whichever focused last
+            if self.my_tab.is_some()
+                && !self.hidden
+                && self.pane_tab.get(&focused) == self.my_tab.as_ref()
+                && !self.keys_on
+            {
+                vlog!("focus my_id={} my_tab={:?} focused={}", self.my_id, self.my_tab, focused);
                 self.prev_focus = Some(focused);
+                // start on what has focus, not where the last keyboard visit ended
+                if let Some(i) = self.active_row_index() {
+                    self.selected = i;
+                }
                 self.keys_on_here(self.my_tab);
                 return true;
             }
@@ -1918,8 +2014,14 @@ impl ZellijPlugin for State {
             self.load_state();
             let mut parts = pipe_message.payload.as_deref().unwrap_or("").split(':');
             let (origin, pane) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-            if self.my_tab.is_none() {
-                self.my_tab = parts.next().and_then(|t| t.parse().ok());
+            // the sender is the visible instance: its position for this tab is
+            // fresh, ours may predate a closed tab (then we switched to the
+            // neighbouring tab, the one already shown)
+            if let Some(t) = parts.next().and_then(|t| t.parse().ok()) {
+                if self.my_tab != Some(t) {
+                    vlog!("take-keys my_id={} stale my_tab={:?} -> {}", self.my_id, self.my_tab, t);
+                }
+                self.my_tab = Some(t);
             }
             // select before switching: this tab shows with the row already chosen
             if let Ok(id) = pane.parse::<u32>() {

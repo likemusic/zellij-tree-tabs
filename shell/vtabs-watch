@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Follow the sidebar's clicks in the Zellij log and report the ones that went
+nowhere (local change).
+
+Usage: vtabs-watch [session] [--all]
+
+The last `VTABS click ... tab=<position> pane=<id>` line of a burst is checked
+1.5 s later against the session: the shown tab must be the clicked one, and for a pane
+row that pane must have the focus. Only misses are printed, one line each
+(`--all` prints the hits too), so the output can drive a monitor. Hand-overs
+where an instance had a stale idea of its tab (`VTABS take-keys ... stale`)
+are passed through.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+LOG = "/tmp/zellij-%d/zellij-log/zellij.log" % os.getuid()
+CLICK = re.compile(r"VTABS click my_id=(\d+) my_tab=(\S+) row=(\d+) tab=Some\((\d+)\) tab_id=(\S+) pane=(\S+)")
+
+
+def zellij(session, *args):
+    r = subprocess.run(["timeout", "5", "zellij", "-s", session, "action", *args], capture_output=True, text=True)
+    return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+
+
+def focus(session):
+    """(active tab position, focused terminal pane in it); None if Zellij did
+    not answer (a busy server times out)"""
+    tabs = zellij(session, "list-tabs", "--json")
+    panes = zellij(session, "list-panes", "--json")
+    if tabs is None or panes is None:
+        return None
+    active = next((t["position"] for t in tabs if t.get("active")), None)
+    pane = next((p["id"] for p in panes if p.get("tab_position") == active and p.get("is_focused") and not p.get("is_plugin") and not p.get("is_floating")), None)
+    return active, pane
+
+
+def follow(path):
+    """Log lines as they come; None every 0.3 s of silence."""
+    f = open(path, errors="replace")
+    f.seek(0, os.SEEK_END)
+    while True:
+        line = f.readline()
+        if line:
+            yield line
+            continue
+        yield None
+        time.sleep(0.3)
+        # zellij starts a new log when the server restarts
+        if os.path.exists(path) and os.stat(path).st_ino != os.fstat(f.fileno()).st_ino:
+            f = open(path, errors="replace")
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--all"]
+    verbose = "--all" in sys.argv
+    session = args[0] if args else os.environ.get("ZELLIJ_SESSION_NAME", "work")
+    pending = None  # (due time, click groups): judged once 1.5 s pass without another click
+    for line in follow(LOG):
+        if pending and time.time() >= pending[0]:
+            my_id, my_tab, row, tab, tab_id, pane = pending[1]
+            pending = None
+            want_tab = int(tab)
+            want_pane = int(pane[5:-1]) if pane.startswith("Some(") else None
+            # a miss is checked once more a second later: a loaded server is slow
+            for attempt in (0, 1):
+                got = focus(session)
+                ok = got is not None and got[0] == want_tab and (want_pane is None or got[1] == want_pane)
+                if ok or attempt:
+                    break
+                time.sleep(1)
+            if got is None:
+                tag = "????"
+            else:
+                tag = "OK  " if ok else "MISS"
+            if verbose or not ok:
+                print("%s click from plugin %s (tab %s) on row %s: want tab %d pane %s, got %s" % (
+                    tag, my_id, my_tab, row, want_tab, want_pane,
+                    "no answer from zellij" if got is None else "tab %s pane %s" % got), flush=True)
+        if line is None:
+            continue
+        if "VTABS take-keys" in line and "stale" in line:
+            print("STALE " + line.split("VTABS ", 1)[1].strip(), flush=True)
+            continue
+        m = CLICK.search(line)
+        if m:
+            # a newer click supersedes the one still waiting: only the last counts
+            pending = (time.time() + 1.5, m.groups())
+
+
+if __name__ == "__main__":
+    main()
