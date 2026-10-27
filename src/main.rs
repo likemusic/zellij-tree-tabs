@@ -67,6 +67,10 @@ const STATE_FILE_PREFIX: &str = "/cache/vtabs-state-";
 /// (task-hub's project tree) can write it. Re-read with the state file.
 const GROUPS_FILE: &str = "/cache/vtabs-groups";
 
+/// Worktrees are listed every this many title refreshes (2 s each), and when
+/// the sidebar is shown.
+const WORKTREE_TICKS: u32 = 15;
+
 /// Unread panes (`pane_unread`), space-separated ids, one file per session.
 const UNREAD_FILE_PREFIX: &str = "/cache/vtabs-unread-";
 
@@ -242,6 +246,27 @@ fn dir_group_path(rules: &[(String, String)], cwd: &str) -> Option<(Vec<String>,
         }
         Some((segs, fixed))
     })
+}
+
+/// `git worktree list --porcelain`: (path, branch) per worktree, main first;
+/// bare and prunable entries left out, a detached one has an empty branch.
+fn parse_worktrees(out: &str) -> Vec<(String, String)> {
+    out.split("\n\n")
+        .filter_map(|block| {
+            let mut path = None;
+            let mut branch = String::new();
+            for line in block.lines() {
+                if let Some(p) = line.strip_prefix("worktree ") {
+                    path = Some(p.to_string());
+                } else if let Some(b) = line.strip_prefix("branch ") {
+                    branch = b.strip_prefix("refs/heads/").unwrap_or(b).to_string();
+                } else if line == "bare" || line.starts_with("prunable") {
+                    return None;
+                }
+            }
+            path.map(|p| (p, branch))
+        })
+        .collect()
 }
 
 fn path_segments(s: &str, sep: char) -> Vec<String> {
@@ -579,6 +604,12 @@ struct State {
     pane_unread: BTreeSet<u32>,
     /// focused terminal pane of this instance's tab (from PaneUpdate)
     my_focused: Option<u32>,
+    /// `git worktree list` per repo (local change): main worktree path -> its
+    /// other worktrees (path, branch), and which repo each tab cwd is in
+    worktrees: BTreeMap<String, Vec<(String, String)>>,
+    cwd_repo: BTreeMap<String, String>,
+    /// title refreshes since the last worktree listing
+    wt_ticks: u32,
     /// tab_group_paths' last result and the hash of what it was computed from
     group_paths_cache: std::cell::RefCell<Option<(u64, BTreeMap<usize, String>)>>,
     /// per-pane background work of its Claude session (local change, from
@@ -684,6 +715,9 @@ enum Row {
     /// keyboard mode browses onto it (frame highlighted), Enter/click focuses it
     /// `flat`: a session row of the status view — no tree branch, tab-row indent
     Pane { id: u32, title: String, depth: usize, focused: bool, last: bool, flat: bool, attention: Option<Attention>, unread: bool },
+    /// a worktree of a repo shown above with no tab or session in it (local
+    /// change); Enter/click opens a tab there
+    Worktree { path: String, label: String, depth: usize },
 }
 
 impl State {
@@ -974,7 +1008,18 @@ impl State {
                 skip_below = Some(node.depth);
                 continue;
             }
-            for it in items.remove(&node.path).unwrap_or_default() {
+            let node_items = items.remove(&node.path).unwrap_or_default();
+            // repos whose main worktree a tab of this group works in
+            let mut repos: Vec<&String> = Vec::new();
+            for it in &node_items {
+                if let Some(main) = self.tab_cwd.get(&it.position).and_then(|c| self.cwd_repo.get(c).filter(|m| *m == c)) {
+                    if !repos.contains(&main) {
+                        repos.push(main);
+                    }
+                }
+            }
+            let repos: Vec<String> = repos.into_iter().cloned().collect();
+            for it in node_items {
                 let panes = self.tab_panes.get(&it.position);
                 rows.push(Row::Tab {
                     position: it.position,
@@ -996,6 +1041,31 @@ impl State {
                             attention: self.pane_attention.get(id).copied(),
                             unread: self.pane_unread.contains(id),
                         });
+                    }
+                }
+            }
+            for main in repos {
+                let closed = self.closed_worktrees(&main);
+                if closed.is_empty() {
+                    continue;
+                }
+                // folded unless opened: the key is in `collapsed` while open
+                let name = format!("{}/⎇{}", node.path, basename(&main));
+                let open = self.collapsed.contains(&name);
+                rows.push(Row::Group {
+                    name,
+                    label: format!("⎇ {}", basename(&main)),
+                    depth: node.depth + 1,
+                    collapsed: !open,
+                    count: closed.len(),
+                    attention: None,
+                    unread: false,
+                });
+                if open {
+                    for (path, branch) in closed {
+                        let dir = basename(&path).to_string();
+                        let label = if branch.is_empty() || branch == dir { dir } else { format!("{} ({})", dir, branch) };
+                        rows.push(Row::Worktree { path, label, depth: node.depth + 1 });
                     }
                 }
             }
@@ -1131,6 +1201,10 @@ impl State {
             }
         }
         changed |= self.refresh_tab_cwds();
+        if self.wt_ticks == 0 {
+            self.list_worktrees();
+        }
+        self.wt_ticks = (self.wt_ticks + 1) % WORKTREE_TICKS;
         self.auto_name_tabs();
         changed
     }
@@ -1139,9 +1213,6 @@ impl State {
     /// reports one — a held pane of a restored session may not. True if any
     /// changed. Skipped without rules: one host call per tab every refresh.
     fn refresh_tab_cwds(&mut self) -> bool {
-        if self.dir_groups.is_empty() {
-            return false;
-        }
         let mut changed = false;
         for (position, panes) in &self.tab_panes {
             let cwd = panes.iter().find_map(|(id, _, _)| {
@@ -1366,6 +1437,15 @@ impl State {
                 focus_terminal_pane(*id, false, false);
                 true
             }
+            Row::Worktree { path, label, .. } => {
+                let name = label.split(" (").next().unwrap_or(label).to_string();
+                let path = path.clone();
+                if self.keys_on {
+                    self.keys_off(false);
+                }
+                new_tab(Some(name.as_str()), Some(path.as_str()));
+                true
+            }
         }
     }
 
@@ -1439,7 +1519,7 @@ impl State {
                 }
                 true
             }
-            Some(Row::Pane { .. }) | None => false,
+            Some(Row::Pane { .. }) | Some(Row::Worktree { .. }) | None => false,
         }
     }
 
@@ -1767,6 +1847,8 @@ impl State {
                 let rows = self.build_rows();
                 match rows.get(self.selected) {
                     Some(Row::Group { .. }) if self.status_view => false,
+                    // the worktree list of a repo: nothing to rename
+                    Some(Row::Group { name, .. }) if name.contains('⎇') => false,
                     Some(Row::Group { name, .. }) => {
                         self.renaming =
                             Some((RenameTarget::Group(name.clone()), leaf_name(name).to_string()));
@@ -1784,7 +1866,7 @@ impl State {
                         self.renaming = Some((RenameTarget::Tab(*position), label));
                         true
                     }
-                    Some(Row::Pane { .. }) | None => false,
+                    Some(Row::Pane { .. }) | Some(Row::Worktree { .. }) | None => false,
                 }
             }
             _ => false,
@@ -1804,7 +1886,7 @@ impl State {
             }
             Some(Row::Group { depth: 0, .. }) | None => return false,
             Some(Row::Group { depth, .. }) => Some(depth - 1),
-            Some(Row::Tab { depth, .. }) => Some(*depth),
+            Some(Row::Tab { depth, .. }) | Some(Row::Worktree { depth, .. }) => Some(*depth),
             Some(Row::Pane { .. }) => None,
         };
         let up = rows[..self.selected].iter().rposition(|r| match (r, parent_depth) {
@@ -1839,6 +1921,46 @@ impl State {
             }
             _ => false,
         }
+    }
+
+    /// Ask git for the worktrees of every tab's repo (answers come as
+    /// RunCommandResult). Visible instance only.
+    fn list_worktrees(&self) {
+        if self.hidden {
+            return;
+        }
+        let cwds: BTreeSet<&String> = self.tab_cwd.values().collect();
+        for cwd in cwds {
+            let ctx = BTreeMap::from([
+                ("vtabs".to_string(), "worktrees".to_string()),
+                ("cwd".to_string(), cwd.clone()),
+            ]);
+            run_command(&["git", "-C", cwd, "worktree", "list", "--porcelain"], ctx);
+        }
+    }
+
+    /// Worktrees of the repo whose main worktree is `main` that nothing is open
+    /// in: no tab works there and no tab or pane (a session) carries its name —
+    /// sessions are often started in the main worktree and named after theirs.
+    fn closed_worktrees(&self, main: &str) -> Vec<(String, String)> {
+        let Some(wts) = self.worktrees.get(main) else { return Vec::new() };
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for panes in self.tab_panes.values() {
+            for (_, title, _) in panes {
+                names.insert(strip_claude_glyph(title).trim().to_string());
+            }
+        }
+        for t in &self.tabs {
+            names.insert(self.group_of(parse_attention(&t.name).1).1.trim().to_string());
+        }
+        wts.iter()
+            .filter(|(path, branch)| {
+                !self.tab_cwd.values().any(|c| c == path || c.starts_with(&format!("{}/", path)))
+                    && !names.contains(basename(path))
+                    && (branch.is_empty() || !names.contains(branch))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Key hints for the footer: while renaming, or in keyboard mode.
@@ -2045,6 +2167,7 @@ impl State {
             Some(Row::Tab { position, .. }) => (Some(*position), None, None),
             Some(Row::Pane { id, .. }) => (None, Some(*id), None),
             Some(Row::Group { name, .. }) => (None, None, Some(name.clone())),
+            Some(Row::Worktree { path, .. }) => (None, None, Some(path.clone())),
             None => (None, None, None),
         }
     }
@@ -2055,6 +2178,7 @@ impl State {
             Row::Tab { position, .. } => tab == Some(*position),
             Row::Pane { id, .. } => pane == Some(*id),
             Row::Group { name, .. } => group.as_ref() == Some(name),
+            Row::Worktree { path, .. } => group.as_ref() == Some(path),
         });
         self.selected = idx
             .or_else(|| self.active_row_index())
@@ -2073,6 +2197,11 @@ impl State {
             Row::Tab { position, .. } => (Some(*position), None),
             Row::Pane { id, .. } => (self.pane_tab.get(id).copied(), Some(*id)),
             Row::Group { .. } => return,
+            Row::Worktree { .. } => {
+                self.selected = idx;
+                self.activate(idx);
+                return;
+            }
         };
         vlog!(
             "click my_id={} my_tab={:?} row={} tab={:?} tab_id={:?} pane={:?} keys_on={}",
@@ -2200,6 +2329,7 @@ impl ZellijPlugin for State {
             EventType::SessionUpdate,
             EventType::PaneClosed,
             EventType::Visible,
+            EventType::RunCommandResult,
         ]);
         self.ensure_timer();
     }
@@ -2258,7 +2388,7 @@ impl ZellijPlugin for State {
                         Some(Row::Tab { position, .. }) => Some(*position) == self.my_tab,
                         Some(Row::Pane { id, .. }) => self.pane_tab.get(id) == self.my_tab.as_ref(),
                         // a header belongs to no tab: browsing onto it switches nothing
-                        Some(Row::Group { .. }) => true,
+                        Some(Row::Group { .. }) | Some(Row::Worktree { .. }) => true,
                         None => false,
                     };
                 if self.pending_pane.is_some() {
@@ -2473,6 +2603,7 @@ impl ZellijPlugin for State {
             }
             Event::Visible(visible) => {
                 self.hidden = !visible;
+                self.wt_ticks = 0;
                 // Hidden instances stop taking the full pane list and session
                 // list (local change): Zellij sends both to every instance on
                 // any change — a working Claude animates its pane title — and
@@ -2497,6 +2628,22 @@ impl ZellijPlugin for State {
                 }
                 self.ensure_timer();
                 visible
+            }
+            Event::RunCommandResult(exit, stdout, _, ctx)
+                if ctx.get("vtabs").map(String::as_str) == Some("worktrees") =>
+            {
+                let Some(cwd) = ctx.get("cwd").cloned() else { return false };
+                let list = if exit == Some(0) { parse_worktrees(&String::from_utf8_lossy(&stdout)) } else { Vec::new() };
+                let Some(((main, _), rest)) = list.split_first() else {
+                    return self.cwd_repo.remove(&cwd).is_some() && !self.hidden;
+                };
+                let changed = self.cwd_repo.get(&cwd) != Some(main) || self.worktrees.get(main).map(Vec::as_slice) != Some(rest);
+                if changed {
+                    vlog!("worktrees my_id={} cwd={} main={} others={}", self.my_id, cwd, main, rest.len());
+                }
+                self.cwd_repo.insert(cwd, main.clone());
+                self.worktrees.insert(main.clone(), rest.to_vec());
+                changed && !self.hidden
             }
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -2678,9 +2825,13 @@ impl ZellijPlugin for State {
                     Row::Tab { attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
                     Row::Tab { active, .. } => (if *active { "●" } else { "·" }).to_string(),
                     Row::Pane { attention, unread, .. } => format!(" {}", self.icon_slot(*attention, *unread)),
+                    Row::Worktree { .. } => "○".to_string(),
                 }
             } else {
                 match row {
+                    Row::Worktree { label, depth, .. } => {
+                        format!("{}    \u{1b}[2m○ {}\u{1b}[22m", "  ".repeat(*depth), label)
+                    }
                     Row::Group { name, label, depth, collapsed, count, attention, unread } => {
                         let indent = "  ".repeat(*depth);
                         let disc = if *collapsed { "▶" } else { "▼" };
@@ -2905,6 +3056,22 @@ mod tests {
     fn parse_attention_roundtrips_with_set() {
         let (_, base) = parse_attention("⏳ x:y");
         assert_eq!(format!("{}{}", MARK_WAITING, base), "⏳ x:y");
+    }
+
+    #[test]
+    fn parse_worktrees_main_first_skips_bare_and_prunable() {
+        let out = "worktree /r/develop\nHEAD abc\nbranch refs/heads/develop\n\n\
+                   worktree /r/fix\nHEAD def\nbranch refs/heads/fix/auth\n\n\
+                   worktree /r/ci\nHEAD 123\ndetached\n\n\
+                   worktree /r/gone\nHEAD 456\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location\n";
+        assert_eq!(
+            parse_worktrees(out),
+            vec![
+                ("/r/develop".to_string(), "develop".to_string()),
+                ("/r/fix".to_string(), "fix/auth".to_string()),
+                ("/r/ci".to_string(), String::new()),
+            ]
+        );
     }
 
     #[test]
@@ -3197,6 +3364,7 @@ mod tests {
                 Row::Group { name, .. } => name.clone(),
                 Row::Pane { title, .. } => format!("  {}", title.split('\u{1b}').next().unwrap()),
                 Row::Tab { .. } => "tab?".to_string(),
+                Row::Worktree { .. } => "worktree?".to_string(),
             })
             .collect();
         assert_eq!(

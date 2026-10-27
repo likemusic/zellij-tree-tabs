@@ -328,6 +328,14 @@ re-read on every tab switch and needs no layout change — a changed plugin bloc
 different plugin to Zellij, so key binds that message the old one would launch a new
 copy. Another tool can write the file too (e.g. a project tree kept elsewhere).
 
+### Worktrees with nothing open
+
+Under a group holding a tab that works in a repo's main worktree, a folded `⎇ <repo> (N)`
+row lists the repo's other worktrees (`git worktree list`, refreshed every 30 s and when the
+sidebar is shown) that nothing is open in: no tab works there and no tab or pane carries the
+worktree's name — Claude sessions are often started in the main worktree and named after
+the one they work in. Unfold it with `→`, Enter or a click on a worktree opens a new tab there.
+
 ### Claude Code worktrees
 
 To have `claude -w fix-auth` label its tab with the worktree name (`repo:fix-auth`), add a
