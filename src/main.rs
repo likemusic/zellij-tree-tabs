@@ -329,6 +329,14 @@ fn move_in(order: &mut [String], name: &str, delta: isize) -> bool {
 
 /// Split the attention marker off a tab name: "⏳ work:api" -> (Waiting, "work:api").
 /// Markers are prefixes (local change): the state reads first, before the name.
+/// A pane title that is the shell's own `user@host: path` (bash's default
+/// xterm title): the shell is at its prompt, nothing runs in the pane.
+fn is_shell_prompt_title(title: &str) -> bool {
+    title
+        .split_once(": ")
+        .is_some_and(|(who, _)| !who.is_empty() && !who.contains(' ') && who.contains('@'))
+}
+
 fn parse_attention(name: &str) -> (Option<Attention>, &str) {
     if let Some(base) = name.strip_prefix(MARK_WAITING) {
         (Some(Attention::Waiting), base)
@@ -450,7 +458,14 @@ struct State {
     resize_step: usize,
     /// own width as of the last tick (see sync_width)
     cols_settled: usize,
+    /// (own columns, full tab width) at which sync_width last had nothing to
+    /// do: a settled width away from it, with no resize of ours in flight, is
+    /// the user's — a border dragged with the mouse or resize mode
+    rest_cols: Option<(usize, usize)>,
     width_stuck: Option<(usize, bool)>,
+    /// (tab id, name) of leftover marks already stripped: PaneUpdates keep
+    /// coming before the TabUpdate with the new name, don't rename again
+    stale_renamed: Vec<(usize, String)>,
     /// resizes in a row that had no effect — one sent while a swap layout is
     /// being applied gets lost, so give up only after a few
     resize_misses: u8,
@@ -1536,18 +1551,27 @@ impl State {
         if c != self.cols_settled {
             return;
         }
+        if self.last_resize.is_none() && self.adopt_user_width(c) {
+            return;
+        }
         let step = self.step_cols();
         let increase = if c < target && (c + step).abs_diff(target) < target - c {
             true
         } else if c > target && c.saturating_sub(step).abs_diff(target) < c - target {
             false
         } else {
+            self.rest_cols = Some((c, self.full_cols));
             return;
         };
         if self.width_stuck == Some((c, increase)) {
+            self.rest_cols = Some((c, self.full_cols));
             return;
         }
-        let Some(neighbor) = self.neighbor else { return };
+        let Some(neighbor) = self.neighbor else {
+            self.rest_cols = Some((c, self.full_cols));
+            return;
+        };
+        self.rest_cols = None;
         vlog!("width resize my_id={} cols={} target={} step={} increase={} neighbor={}", self.my_id, c, target, step, increase, neighbor);
         // the neighbour gives up (or takes) columns on its left edge
         let resize = if increase { Resize::Decrease } else { Resize::Increase };
@@ -1556,6 +1580,34 @@ impl State {
             PaneId::Terminal(neighbor),
         );
         self.last_resize = Some((c, increase, 0));
+    }
+
+    /// The sidebar's border was moved by hand (mouse drag, resize mode) while
+    /// it sat at rest: make that width the target of every tab's sidebar
+    /// instead of pulling it back. Not after a tab switch (`rest_cols` is reset
+    /// on Visible: the shown width is a stale one) and not when the whole tab
+    /// changed width (the terminal window was resized). True if adopted.
+    fn adopt_user_width(&mut self, c: usize) -> bool {
+        let Some((rest, full)) = self.rest_cols else { return false };
+        if rest == c || full != self.full_cols {
+            if full != self.full_cols {
+                self.rest_cols = None;
+            }
+            return false;
+        }
+        // a relayout that settled on a huge width (fullscreen, a lost swap
+        // layout) is not a width anyone picked
+        if self.full_cols > 0 && c * 3 > self.full_cols * 2 {
+            return false;
+        }
+        vlog!("width adopt my_id={} cols={} was={} target={:?}", self.my_id, c, rest, self.width);
+        self.width = Some(c);
+        self.width_saved = None;
+        self.width_stuck = None;
+        self.resize_misses = 0;
+        self.rest_cols = Some((c, self.full_cols));
+        self.save_state();
+        true
     }
 
     /// Switch project/status view, keeping the selection on the same tab or pane.
@@ -1911,6 +1963,32 @@ impl ZellijPlugin for State {
                         set_timeout(0.5);
                     }
                 }
+                // A restored session (local change): Zellij brings tab names back
+                // with the marks they had, but the sessions behind them are not
+                // running — their panes wait for Enter (held), have exited, or are
+                // a shell sitting at its prompt.
+                // Working/waiting there is a leftover; done (✅) stays, it is
+                // still unread. Only the visible instance acts: its tab names are
+                // fresh, a hidden one's could rename a tab back.
+                if !self.hidden {
+                    for (tab_pos, panes) in &manifest.panes {
+                        let mut terminals = panes.iter().filter(|p| !p.is_plugin).peekable();
+                        if terminals.peek().is_none()
+                            || !terminals.all(|p| p.is_held || p.exited || is_shell_prompt_title(&p.title))
+                        {
+                            continue;
+                        }
+                        let Some(t) = self.tabs.iter().find(|t| t.position == *tab_pos) else { continue };
+                        let (att, base) = parse_attention(&t.name);
+                        if matches!(att, Some(Attention::Working | Attention::Waiting))
+                            && !self.stale_renamed.iter().any(|(id, n)| *id == t.tab_id && *n == t.name)
+                        {
+                            vlog!("stale mark tab={} name={:?}", tab_pos, t.name);
+                            self.stale_renamed.push((t.tab_id, t.name.clone()));
+                            rename_tab_with_id(t.tab_id as u64, base.to_string());
+                        }
+                    }
+                }
                 if let Some(my_tab) = self.my_tab {
                     if !self.keys_on {
                         if let Some(p) = manifest.panes.get(&my_tab).and_then(|ps| {
@@ -1963,6 +2041,7 @@ impl ZellijPlugin for State {
                     self.width_stuck = None;
                     self.resize_misses = 0;
                     self.last_resize = None;
+                    self.rest_cols = None;
                     self.sync_width(false);
                 }
                 self.ensure_timer();
@@ -2299,6 +2378,14 @@ fn truncate_visible(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_prompt_title() {
+        assert!(is_shell_prompt_title("likemusic@DESKTOP-VPPAGPR: ~/Projects/wsa-lineage"));
+        assert!(!is_shell_prompt_title("✳ wsa-vps"));
+        assert!(!is_shell_prompt_title("node /home/likemusic/bin/claude --resume"));
+        assert!(!is_shell_prompt_title("ssh user@host: whatever"));
+    }
 
     #[test]
     fn parse_attention_variants() {
