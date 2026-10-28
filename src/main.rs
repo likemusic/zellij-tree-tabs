@@ -602,6 +602,8 @@ struct State {
     separator: char,
     waiting_icon: String,
     completed_icon: String,
+    /// state icon of a pane whose command exited (local change, `exited_icon`)
+    exited_icon: String,
     /// background-work column icons (local change, `shell_icon` / `monitor_icon`)
     shell_icon: String,
     monitor_icon: String,
@@ -1515,6 +1517,13 @@ impl State {
     fn state_slot(&self, att: Option<Attention>, unread: bool, bg: (u16, u16)) -> String {
         let glyph = if att.is_some() { self.icon(att, unread).trim_end().to_string() } else { " ".to_string() };
         format!("{}{} ", glyph, self.background_slot(bg))
+    }
+
+    /// Whether every pane of the tab exited (local change): the tab is paused.
+    fn tab_exited(&self, position: usize) -> bool {
+        self.tab_panes
+            .get(&position)
+            .is_some_and(|ps| !ps.is_empty() && ps.iter().all(|p| self.pane_exited.contains_key(&p.0)))
     }
 
     /// Background work of a tab row: the sum over its panes.
@@ -2868,6 +2877,10 @@ impl State {
             .get("completed_icon")
             .cloned()
             .unwrap_or_else(|| "✓".to_string());
+        self.exited_icon = configuration
+            .get("exited_icon")
+            .cloned()
+            .unwrap_or_else(|| "⏸".to_string());
         self.shell_icon = configuration
             .get("shell_icon")
             .cloned()
@@ -3808,6 +3821,7 @@ impl State {
                     Row::Group { collapsed, .. } => (if *collapsed { "▶" } else { "▼" }).to_string(),
                     Row::Tab { attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
                     Row::Tab { active, .. } => (if *active { "●" } else { "·" }).to_string(),
+                    Row::Pane { id, .. } if self.pane_exited.contains_key(id) => format!(" \u{1b}[2m{}\u{1b}[22m ", self.exited_icon),
                     Row::Pane { attention, unread, .. } => format!(" {}", self.icon_slot(*attention, *unread)),
                     Row::Worktree { .. } => "○".to_string(),
                 }
@@ -3847,7 +3861,11 @@ impl State {
                         if let Some(buf) = editing {
                             format!("{}  {}{}", indent, fold_mark(*fold), with_cursor(buf, self.rename_back))
                         } else {
-                            let slot = self.state_slot(*attention, *unread, self.tab_background(*position));
+                            let slot = if self.tab_exited(*position) {
+                                format!("\u{1b}[2m{}\u{1b}[22m{} ", self.exited_icon, self.background_slot(self.tab_background(*position)))
+                            } else {
+                                self.state_slot(*attention, *unread, self.tab_background(*position))
+                            };
                             let bell = if self.tab_has_bell(*position) { BELL_MARK } else { "" };
                             format!("{}  {}{}{}{}", indent, fold_mark(*fold), slot, label, bell)
                         }
@@ -3855,7 +3873,11 @@ impl State {
                     Row::Pane { id, title, depth, focused, last, flat, fav, attention, unread } => {
                         let indent = "  ".repeat(*depth);
                         let branch = if *last { "└" } else { "├" };
-                        let icon = self.state_slot(*attention, *unread, self.background_of([id]));
+                        let icon = match self.pane_exited.get(id) {
+                            // paused in the state column, where its ✓ was
+                            Some(_) => format!("\u{1b}[2m{}\u{1b}[22m{} ", self.exited_icon, self.background_slot(self.background_of([id]))),
+                            None => self.state_slot(*attention, *unread, self.background_of([id])),
+                        };
                         let title = strip_claude_glyph(title);
                         // an exited pane Zellij holds: Enter in it runs the command again
                         let title = match self.pane_exited.get(id) {
@@ -3867,7 +3889,7 @@ impl State {
                                     _ => String::new(),
                                 };
                                 let title = if title.is_empty() { "closed" } else { title };
-                                format!("\u{1b}[2m‖ {}{}\u{1b}[22m", title, what)
+                                format!("\u{1b}[2m{}{}\u{1b}[22m", title, what)
                             }
                             None => title.to_string(),
                         };
