@@ -1573,12 +1573,12 @@ impl State {
         for panes in self.tab_panes.values_mut() {
             for (id, title, _) in panes.iter_mut() {
                 if let Some(info) = get_pane_info(PaneId::Terminal(*id)) {
-                    let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, *id, &info.title, info.exited);
+                    let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, *id, &info.title, info.terminal_command.as_deref(), info.exited || info.is_held);
                     if *title != t {
                         *title = t;
                         changed = true;
                     }
-                    let exited = info.exited.then_some(info.exit_status);
+                    let exited = (info.exited || info.is_held).then_some(info.exit_status);
                     if self.pane_exited.get(id) != exited.as_ref() {
                         match exited {
                             Some(code) => self.pane_exited.insert(*id, code),
@@ -2880,7 +2880,7 @@ impl State {
         self.exited_icon = configuration
             .get("exited_icon")
             .cloned()
-            .unwrap_or_else(|| "⏸".to_string());
+            .unwrap_or_else(|| "‖".to_string());
         self.shell_icon = configuration
             .get("shell_icon")
             .cloned()
@@ -3125,12 +3125,13 @@ impl State {
                     let titled: Vec<_> = list
                         .iter()
                         .map(|p| {
-                            let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, p.id, &p.title, p.exited);
+                            let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, p.id, &p.title, p.terminal_command.as_deref(), p.exited || p.is_held);
                             (p.id, t, p.is_focused)
                         })
                         .collect();
                     for p in &list {
-                        if p.exited {
+                        // held without exiting: a restored session's pane waiting for Enter
+                        if p.exited || p.is_held {
                             self.pane_exited.insert(p.id, p.exit_status);
                         } else {
                             self.pane_exited.remove(&p.id);
@@ -4053,7 +4054,18 @@ fn tab_name_from_pane(title: &str) -> String {
 /// row's state icon already says it, and `✳` draws as a 2-column emoji.
 /// A pane's title for its row (local change): the short title, remembered while
 /// it is not empty; an exited pane, whose title Zellij clears, gets the last one.
-fn pane_title(last: &mut BTreeMap<u32, String>, dirty: &mut bool, id: u32, raw: &str, exited: bool) -> String {
+/// A claude-zellij pane titled with its own command line (held, not started yet)
+/// counts as untitled too: the name of its session is looked up instead.
+fn pane_title(last: &mut BTreeMap<u32, String>, dirty: &mut bool, id: u32, raw: &str, cmd: Option<&str>, exited: bool) -> String {
+    let raw = if cmd.is_some_and(|c| c == raw && zellij_marker(c).is_some()) {
+        if last.get(&id).is_some_and(|l| l == raw) {
+            last.remove(&id);
+            *dirty = true;
+        }
+        ""
+    } else {
+        raw
+    };
     let t = short_title(raw);
     if t.is_empty() {
         return if exited { last.get(&id).cloned().unwrap_or_default() } else { t };
@@ -4416,17 +4428,23 @@ mod tests {
     #[test]
     fn exited_pane_keeps_its_last_title() {
         let (mut last, mut dirty) = (BTreeMap::new(), false);
-        assert_eq!(pane_title(&mut last, &mut dirty, 7, "✳ custom.by", false), "✳ custom.by");
+        assert_eq!(pane_title(&mut last, &mut dirty, 7, "✳ custom.by", None, false), "✳ custom.by");
         assert!(dirty);
         assert_eq!(last.get(&7).map(String::as_str), Some("custom.by"));
         dirty = false;
         // the spinner glyph changing is not a new title
-        pane_title(&mut last, &mut dirty, 7, "⠐ custom.by", false);
+        pane_title(&mut last, &mut dirty, 7, "⠐ custom.by", None, false);
         assert!(!dirty);
         // Zellij clears the title once the command exits
-        assert_eq!(pane_title(&mut last, &mut dirty, 7, "", true), "custom.by");
-        assert_eq!(pane_title(&mut last, &mut dirty, 8, "", true), "");
-        assert_eq!(pane_title(&mut last, &mut dirty, 7, "", false), "");
+        assert_eq!(pane_title(&mut last, &mut dirty, 7, "", None, true), "custom.by");
+        assert_eq!(pane_title(&mut last, &mut dirty, 8, "", None, true), "");
+        assert_eq!(pane_title(&mut last, &mut dirty, 7, "", None, false), "");
+        // a held claude-zellij pane titled with its command: untitled, not remembered
+        let cmd = "python3 h.py --marker abc -- claude";
+        assert_eq!(pane_title(&mut last, &mut dirty, 9, cmd, Some(cmd), true), "");
+        assert!(!last.contains_key(&9));
+        // any other command keeps its command line as the title
+        assert_eq!(pane_title(&mut last, &mut dirty, 10, "npm run dev", Some("npm run dev"), true), "npm run dev");
     }
 
     #[test]
