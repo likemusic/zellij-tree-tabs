@@ -78,6 +78,9 @@ const UNREAD_FILE_PREFIX: &str = "/cache/vtabs-unread-";
 /// rows, they popped in a moment later and moved the rows under the mouse.
 const PIN_FILE_PREFIX: &str = "/cache/vtabs-pin-";
 const WORKTREES_FILE_PREFIX: &str = "/cache/vtabs-worktrees-";
+/// Last known title of each pane, per session (local change): Zellij clears the
+/// title of a pane whose command exited, and its row went blank.
+const TITLES_FILE_PREFIX: &str = "/cache/vtabs-titles-";
 
 fn parse_groups_file(s: &str) -> Vec<(String, String)> {
     s.lines()
@@ -631,6 +634,11 @@ struct State {
     keys_origin: Option<usize>,
     /// tab position -> its tiled terminal panes (id, title, focused) in screen order
     tab_panes: BTreeMap<usize, Vec<(u32, String, bool)>>,
+    /// panes whose command exited and that Zellij holds (local change), with the exit code
+    pane_exited: BTreeMap<u32, Option<i32>>,
+    /// last non-empty title of each pane (local change), shown for an exited one
+    last_titles: BTreeMap<u32, String>,
+    titles_dirty: bool,
     /// per-pane state from the same pipes as the tab markers (local change), kept
     /// in memory: every instance gets every pipe, so each holds the full map
     pane_attention: BTreeMap<u32, Attention>,
@@ -1351,14 +1359,23 @@ impl State {
         for panes in self.tab_panes.values_mut() {
             for (id, title, _) in panes.iter_mut() {
                 if let Some(info) = get_pane_info(PaneId::Terminal(*id)) {
-                    let t = short_title(&info.title);
+                    let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, *id, &info.title, info.exited);
                     if *title != t {
                         *title = t;
+                        changed = true;
+                    }
+                    let exited = info.exited.then_some(info.exit_status);
+                    if self.pane_exited.get(id) != exited.as_ref() {
+                        match exited {
+                            Some(code) => self.pane_exited.insert(*id, code),
+                            None => self.pane_exited.remove(id),
+                        };
                         changed = true;
                     }
                 }
             }
         }
+        self.save_titles();
         changed |= self.refresh_tab_cwds();
         if self.wt_ticks == 0 {
             self.list_worktrees();
@@ -1554,6 +1571,33 @@ impl State {
         }
     }
 
+    fn titles_file(&self) -> Option<String> {
+        self.session.as_ref().map(|s| format!("{}{}", TITLES_FILE_PREFIX, s))
+    }
+
+    fn save_titles(&mut self) {
+        if self.hidden || !self.titles_dirty {
+            return;
+        }
+        self.titles_dirty = false;
+        if let Some(path) = self.titles_file() {
+            let lines: Vec<String> = self.last_titles.iter().map(|(id, t)| format!("{}\t{}", id, t)).collect();
+            let _ = std::fs::write(path, lines.join("\n"));
+        }
+    }
+
+    fn load_titles(&mut self) {
+        if let Some(s) = self.titles_file().and_then(|p| std::fs::read_to_string(p).ok()) {
+            for line in s.lines() {
+                if let Some((id, t)) = line.split_once('\t') {
+                    if let Ok(id) = id.parse() {
+                        self.last_titles.entry(id).or_insert_with(|| t.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     fn load_unread(&mut self) {
         if let Some(s) = self.unread_file().and_then(|p| std::fs::read_to_string(p).ok()) {
             self.pane_unread = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
@@ -1572,6 +1616,10 @@ impl State {
         let a = self.pane_attention.remove(&id).is_some();
         let b = self.pane_background.remove(&id).is_some();
         let c = self.pane_unread.remove(&id);
+        self.pane_exited.remove(&id);
+        if self.last_titles.remove(&id).is_some() {
+            self.titles_dirty = true;
+        }
         if c {
             self.save_unread();
         }
@@ -2666,6 +2714,7 @@ impl State {
                     self.load_state();
                     if self.role == Role::Brain {
                         self.load_unread();
+                        self.load_titles();
                         self.load_worktrees();
                     }
                     return true;
@@ -2815,10 +2864,21 @@ impl State {
                         .collect();
                     // a stack's panes share their position; id keeps them in stack order
                     list.sort_by_key(|p| (p.pane_y, p.pane_x, p.id));
-                    self.tab_panes.insert(
-                        *tab_pos,
-                        list.iter().map(|p| (p.id, short_title(&p.title), p.is_focused)).collect(),
-                    );
+                    let titled: Vec<_> = list
+                        .iter()
+                        .map(|p| {
+                            let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, p.id, &p.title, p.exited);
+                            (p.id, t, p.is_focused)
+                        })
+                        .collect();
+                    for p in &list {
+                        if p.exited {
+                            self.pane_exited.insert(p.id, p.exit_status);
+                        } else {
+                            self.pane_exited.remove(&p.id);
+                        }
+                    }
+                    self.tab_panes.insert(*tab_pos, titled);
                     for p in panes {
                         if !p.is_plugin {
                             self.pane_tab.insert(p.id, *tab_pos);
@@ -2849,6 +2909,7 @@ impl State {
                         }
                     }
                 }
+                self.save_titles();
                 // the leftmost tiled terminal right of the sidebar: resizing it on its
                 // left edge is what moves the sidebar's border (a resize of the
                 // sidebar itself is ignored once a swap layout nests the panes)
@@ -3009,6 +3070,7 @@ impl State {
                     self.last_resize = None;
                     self.sync_width(false);
                     self.load_unread();
+                    self.load_titles();
                     self.mark_focused_read();
                 }
                 self.ensure_timer();
@@ -3522,6 +3584,19 @@ impl State {
                         let branch = if *last { "└" } else { "├" };
                         let icon = self.state_slot(*attention, *unread, self.background_of([id]));
                         let title = strip_claude_glyph(title);
+                        // an exited pane Zellij holds: Enter in it runs the command again
+                        let title = match self.pane_exited.get(id) {
+                            Some(code) => {
+                                let what = match code {
+                                    Some(c) if *c != 0 => format!("exit {}", c),
+                                    _ => "exited".to_string(),
+                                };
+                                let sep = if title.is_empty() { "" } else { " · " };
+                                format!("\u{1b}[31m✗\u{1b}[39m {}{}\u{1b}[2m{}\u{1b}[22m", title, sep, what)
+                            }
+                            None => title.to_string(),
+                        };
+                        let title = title.as_str();
                         if *flat {
                             let dot = if *focused { "●" } else { " " };
                             format!("  {} {}{}", dot, icon, title)
@@ -3676,6 +3751,21 @@ fn tab_name_from_pane(title: &str) -> String {
 
 /// Pane title without Claude Code's own status glyph (`✳ wsa`, `⠐ wsa`): the
 /// row's state icon already says it, and `✳` draws as a 2-column emoji.
+/// A pane's title for its row (local change): the short title, remembered while
+/// it is not empty; an exited pane, whose title Zellij clears, gets the last one.
+fn pane_title(last: &mut BTreeMap<u32, String>, dirty: &mut bool, id: u32, raw: &str, exited: bool) -> String {
+    let t = short_title(raw);
+    if t.is_empty() {
+        return if exited { last.get(&id).cloned().unwrap_or_default() } else { t };
+    }
+    let keep = strip_claude_glyph(&t);
+    if last.get(&id).map(String::as_str) != Some(keep) {
+        last.insert(id, keep.to_string());
+        *dirty = true;
+    }
+    t
+}
+
 fn strip_claude_glyph(title: &str) -> &str {
     let mut chars = title.chars();
     match chars.next() {
@@ -3970,6 +4060,22 @@ mod tests {
         assert!(!is_default_tab_name("Tab #"));
         assert!(!is_default_tab_name("Tab #1x"));
         assert!(!is_default_tab_name("work:api"));
+    }
+
+    #[test]
+    fn exited_pane_keeps_its_last_title() {
+        let (mut last, mut dirty) = (BTreeMap::new(), false);
+        assert_eq!(pane_title(&mut last, &mut dirty, 7, "✳ custom.by", false), "✳ custom.by");
+        assert!(dirty);
+        assert_eq!(last.get(&7).map(String::as_str), Some("custom.by"));
+        dirty = false;
+        // the spinner glyph changing is not a new title
+        pane_title(&mut last, &mut dirty, 7, "⠐ custom.by", false);
+        assert!(!dirty);
+        // Zellij clears the title once the command exits
+        assert_eq!(pane_title(&mut last, &mut dirty, 7, "", true), "custom.by");
+        assert_eq!(pane_title(&mut last, &mut dirty, 8, "", true), "");
+        assert_eq!(pane_title(&mut last, &mut dirty, 7, "", false), "");
     }
 
     #[test]
