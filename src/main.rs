@@ -2880,7 +2880,7 @@ impl State {
         self.exited_icon = configuration
             .get("exited_icon")
             .cloned()
-            .unwrap_or_else(|| "‖".to_string());
+            .unwrap_or_else(|| "⊘".to_string());
         self.shell_icon = configuration
             .get("shell_icon")
             .cloned()
