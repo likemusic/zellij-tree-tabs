@@ -81,6 +81,13 @@ const WORKTREES_FILE_PREFIX: &str = "/cache/vtabs-worktrees-";
 /// Last known title of each pane, per session (local change): Zellij clears the
 /// title of a pane whose command exited, and its row went blank.
 const TITLES_FILE_PREFIX: &str = "/cache/vtabs-titles-";
+/// Prints the title of the Claude session behind claude-zellij marker `$1`.
+const SESSION_TITLE_SH: &str = r#"sid=$(cat "$HOME/.local/share/claude-zellij/markers/$1") || exit 1
+f=$(ls "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -1)
+[ -n "$f" ] || exit 1
+t=$(grep -o '"customTitle":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4)
+[ -n "$t" ] || t=$(grep -o '"aiTitle":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4)
+printf '%s' "$t""#;
 /// Favorite panes, per session (local change): one key per line, `m:<marker>`
 /// for a claude-zellij pane (survives a restored session), else `p:<pane id>`.
 const FAVORITES_FILE_PREFIX: &str = "/cache/vtabs-fav-";
@@ -642,6 +649,8 @@ struct State {
     /// last non-empty title of each pane (local change), shown for an exited one
     last_titles: BTreeMap<u32, String>,
     titles_dirty: bool,
+    /// exited panes whose session title was already looked up (local change)
+    title_lookups: BTreeSet<u32>,
     /// favorite panes, in the order they were added (local change): listed on
     /// top of the tree and kept there when the list scrolls
     favorites: Vec<String>,
@@ -1711,6 +1720,30 @@ impl State {
         if let Some(path) = self.titles_file() {
             let lines: Vec<String> = self.last_titles.iter().map(|(id, t)| format!("{}\t{}", id, t)).collect();
             let _ = std::fs::write(path, lines.join("\n"));
+        }
+    }
+
+    /// Title of the Claude session behind an exited pane with no remembered
+    /// title (local change): its claude-zellij marker names the session, whose
+    /// transcript holds the name (`/rename`) or Claude's own title for it.
+    fn lookup_exited_titles(&mut self) {
+        if self.hidden {
+            return;
+        }
+        let ids: Vec<u32> = self
+            .pane_exited
+            .keys()
+            .filter(|id| !self.last_titles.contains_key(id) && !self.title_lookups.contains(id))
+            .copied()
+            .collect();
+        for id in ids {
+            let Some(marker) = self.pane_marker.get(&id) else { continue };
+            self.title_lookups.insert(id);
+            let ctx = BTreeMap::from([
+                ("vtabs".to_string(), "session-title".to_string()),
+                ("pane".to_string(), id.to_string()),
+            ]);
+            run_command(&["sh", "-c", SESSION_TITLE_SH, "sh", marker], ctx);
         }
     }
 
@@ -3057,6 +3090,7 @@ impl State {
                     }
                 }
                 self.save_titles();
+                self.lookup_exited_titles();
                 // the leftmost tiled terminal right of the sidebar: resizing it on its
                 // left edge is what moves the sidebar's border (a resize of the
                 // sidebar itself is ignored once a swap layout nests the panes)
@@ -3246,6 +3280,25 @@ impl State {
                     self.save_worktrees();
                 }
                 changed && !self.hidden
+            }
+            Event::RunCommandResult(exit, stdout, _, ctx)
+                if ctx.get("vtabs").map(String::as_str) == Some("session-title") =>
+            {
+                let Some(id) = ctx.get("pane").and_then(|p| p.parse::<u32>().ok()) else { return false };
+                let title = String::from_utf8_lossy(&stdout).trim().to_string();
+                vlog!("session title pane={} exit={:?} title={:?}", id, exit, title);
+                if exit != Some(0) || title.is_empty() || self.last_titles.contains_key(&id) {
+                    return false;
+                }
+                self.last_titles.insert(id, title.clone());
+                self.titles_dirty = true;
+                self.save_titles();
+                for panes in self.tab_panes.values_mut() {
+                    for p in panes.iter_mut().filter(|p| p.0 == id && p.1.is_empty()) {
+                        p.1 = title.clone();
+                    }
+                }
+                true
             }
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
