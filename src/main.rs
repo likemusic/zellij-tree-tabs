@@ -715,6 +715,13 @@ struct State {
     /// tab id -> name the sidebar gave it from its only pane's title; a tab whose
     /// name no longer matches was renamed by hand and is left alone
     auto_named: BTreeMap<usize, String>,
+    /// Pane ids per tab position in the last PaneUpdate, and whether it changed
+    /// them since the last TabUpdate (local change). Zellij reports a layout
+    /// change as PaneUpdate then TabUpdate; a timer tick in between saw the new
+    /// panes under the old tab list and auto-named a tab after another tab's
+    /// pane (a hospice tab became "rosatom-main" and kept it).
+    pane_sig: Vec<(usize, Vec<u32>)>,
+    layout_pending: bool,
     /// `dirgroup_N "glob -> group"` (local change): a tab whose name carries no
     /// `group:` prefix joins the group of the first rule its working directory
     /// matches — projects group by where they live, whatever the tab is called
@@ -1381,6 +1388,9 @@ impl State {
     /// directory) and follows it — unless the tab was renamed by hand. Run by the
     /// visible instance only: its tab list is fresh (hidden ones miss TabUpdates).
     fn auto_name_tabs(&mut self) {
+        if self.layout_pending {
+            return;
+        }
         let mut renames = Vec::new();
         for t in &self.tabs {
             let Some(panes) = self.tab_panes.get(&t.position) else { continue };
@@ -2659,6 +2669,7 @@ impl State {
             }
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
+                self.layout_pending = false;
                 if self.role == Role::Brain {
                     self.follow_active_screen();
                 }
@@ -2746,6 +2757,15 @@ impl State {
                 redraw
             }
             Event::PaneUpdate(manifest) => {
+                let sig: Vec<_> = manifest
+                    .panes
+                    .iter()
+                    .map(|(pos, ps)| (*pos, ps.iter().map(|p| p.id).collect::<Vec<_>>()))
+                    .collect();
+                if sig != self.pane_sig {
+                    self.pane_sig = sig;
+                    self.layout_pending = true;
+                }
                 if self.role == Role::Brain {
                     self.screen_size = manifest
                         .panes
@@ -2960,6 +2980,8 @@ impl State {
                         vlog!("visible catch-up my_id={} tabs={}", self.my_id, me.tabs.len());
                         self.update_inner(Event::TabUpdate(me.tabs));
                         self.update_inner(Event::PaneUpdate(me.panes));
+                        // one snapshot: tabs and panes agree
+                        self.layout_pending = false;
                     }
                     self.load_worktrees();
                     // a click on this tab's row in the sidebar shown before (read once)
