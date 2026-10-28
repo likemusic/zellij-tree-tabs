@@ -81,6 +81,9 @@ const WORKTREES_FILE_PREFIX: &str = "/cache/vtabs-worktrees-";
 /// Last known title of each pane, per session (local change): Zellij clears the
 /// title of a pane whose command exited, and its row went blank.
 const TITLES_FILE_PREFIX: &str = "/cache/vtabs-titles-";
+/// Favorite panes, per session (local change): one key per line, `m:<marker>`
+/// for a claude-zellij pane (survives a restored session), else `p:<pane id>`.
+const FAVORITES_FILE_PREFIX: &str = "/cache/vtabs-fav-";
 
 fn parse_groups_file(s: &str) -> Vec<(String, String)> {
     s.lines()
@@ -639,6 +642,14 @@ struct State {
     /// last non-empty title of each pane (local change), shown for an exited one
     last_titles: BTreeMap<u32, String>,
     titles_dirty: bool,
+    /// favorite panes, in the order they were added (local change): listed on
+    /// top of the tree and kept there when the list scrolls
+    favorites: Vec<String>,
+    /// claude-zellij marker of each pane (local change), from its command; kept
+    /// once the pane exits — Zellij drops the command of an exited pane
+    pane_marker: BTreeMap<u32, String>,
+    /// rows of the favorites section at the top of the last build_rows
+    fav_rows_n: std::cell::Cell<usize>,
     /// per-pane state from the same pipes as the tab markers (local change), kept
     /// in memory: every instance gets every pipe, so each holds the full map
     pane_attention: BTreeMap<u32, Attention>,
@@ -813,6 +824,7 @@ fn decode_key(s: &str) -> Option<KeyWithModifier> {
 fn encode_mouse(m: &Mouse) -> Option<String> {
     Some(match m {
         Mouse::LeftClick(r, c) => format!("L {} {}", r, c),
+        Mouse::RightClick(r, c) => format!("R {} {}", r, c),
         Mouse::ScrollUp(n) => format!("U {}", n),
         Mouse::ScrollDown(n) => format!("D {}", n),
         _ => return None,
@@ -823,6 +835,7 @@ fn decode_mouse(s: &str) -> Option<Mouse> {
     let f: Vec<&str> = s.split(' ').collect();
     Some(match f.as_slice() {
         ["L", r, c] => Mouse::LeftClick(r.parse().ok()?, c.parse().ok()?),
+        ["R", r, c] => Mouse::RightClick(r.parse().ok()?, c.parse().ok()?),
         ["U", n] => Mouse::ScrollUp(n.parse().ok()?),
         ["D", n] => Mouse::ScrollDown(n.parse().ok()?),
         _ => return None,
@@ -862,7 +875,8 @@ enum Row {
     /// a terminal pane of the tab above, listed when the tab has 2+ panes;
     /// keyboard mode browses onto it (frame highlighted), Enter/click focuses it
     /// `flat`: a session row of the status view — no tree branch, tab-row indent
-    Pane { id: u32, title: String, depth: usize, focused: bool, last: bool, flat: bool, attention: Option<Attention>, unread: bool },
+    /// `fav`: a row of the favorites section on top
+    Pane { id: u32, title: String, depth: usize, focused: bool, last: bool, flat: bool, fav: bool, attention: Option<Attention>, unread: bool },
     /// a worktree of a repo shown above with no tab or session in it (local
     /// change); Enter/click opens a tab there
     Worktree { path: String, label: String, depth: usize },
@@ -1083,6 +1097,7 @@ impl State {
                         focused: *focused && it.active,
                         last: false,
                         flat: true,
+                        fav: false,
                         attention,
                     });
                 }
@@ -1116,12 +1131,14 @@ impl State {
     }
 
     fn build_rows(&self) -> Vec<Row> {
+        self.fav_rows_n.set(0);
         if self.status_view {
             return self.status_rows();
         }
         let mut items: BTreeMap<String, Vec<TabItem>> = self.grouped_items().into_iter().collect();
         let names: Vec<String> = items.keys().cloned().collect();
-        let mut rows = Vec::new();
+        let mut rows = self.favorite_rows(items.values().flatten());
+        self.fav_rows_n.set(rows.len());
         // depth of a collapsed group whose subtree is being skipped
         let mut skip_below: Option<usize> = None;
         for node in group_tree(&names, &self.display_group_order()) {
@@ -1188,6 +1205,7 @@ impl State {
                             focused: *focused,
                             last: i + 1 == panes.len(),
                             flat: false,
+                            fav: false,
                             attention: self.pane_attention.get(id).copied(),
                             unread: self.pane_unread.contains(id),
                         });
@@ -1207,6 +1225,116 @@ impl State {
             }
         }
         rows
+    }
+
+    /// The favorites section (local change): a row per favorite pane — its
+    /// title, its tab, and how many other panes of the tab wait for an answer
+    /// or finished unread — and under the favorite in the active tab, the
+    /// other panes of that tab, to jump to the one that asks.
+    fn favorite_rows<'a>(&self, tabs: impl Iterator<Item = &'a TabItem> + Clone) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let mut expanded = false;
+        for key in &self.favorites {
+            let Some(id) = self.favorite_pane(key) else { continue };
+            let Some(pos) = self.pane_tab.get(&id).copied() else { continue };
+            let Some(it) = tabs.clone().find(|t| t.position == pos) else { continue };
+            let panes = self.tab_panes.get(&pos).map(Vec::as_slice).unwrap_or(&[]);
+            let Some((_, title, focused)) = panes.iter().find(|p| p.0 == id) else { continue };
+            let others: Vec<_> = panes.iter().filter(|p| p.0 != id).collect();
+            let waiting = others.iter().filter(|p| self.pane_attention.get(&p.0) == Some(&Attention::Waiting)).count();
+            let unread = others.iter().filter(|p| self.pane_unread.contains(&p.0)).count();
+            let name = strip_claude_glyph(title);
+            let mut label = if name.is_empty() || name == it.label {
+                it.label.clone()
+            } else {
+                format!("{}\u{1b}[2m · {}\u{1b}[22m", name, it.label)
+            };
+            if waiting > 0 {
+                label += &format!(" \u{1b}[33m{}{}\u{1b}[39m", self.waiting_icon, waiting);
+            }
+            if unread > 0 {
+                label += &format!(" \u{1b}[32m{}{}\u{1b}[39m", self.completed_icon, unread);
+            }
+            let single = panes.len() == 1;
+            rows.push(Row::Pane {
+                id,
+                title: label,
+                depth: 0,
+                focused: *focused && it.active,
+                last: false,
+                flat: true,
+                fav: true,
+                attention: self.pane_attention.get(&id).copied().or(if single { it.attention } else { None }),
+                unread: self.pane_unread.contains(&id),
+            });
+            if it.active && !expanded {
+                expanded = true;
+                for (i, (oid, otitle, ofocused)) in others.iter().enumerate() {
+                    rows.push(Row::Pane {
+                        id: *oid,
+                        title: otitle.clone(),
+                        depth: 0,
+                        focused: *ofocused,
+                        last: i + 1 == others.len(),
+                        flat: false,
+                        fav: false,
+                        attention: self.pane_attention.get(oid).copied(),
+                        unread: self.pane_unread.contains(oid),
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    /// Favorite key of a pane: its claude-zellij marker when it has one.
+    fn favorite_key(&self, id: u32) -> String {
+        match self.pane_marker.get(&id) {
+            Some(m) => format!("m:{}", m),
+            None => format!("p:{}", id),
+        }
+    }
+
+    /// The pane a favorite key stands for now.
+    fn favorite_pane(&self, key: &str) -> Option<u32> {
+        if let Some(m) = key.strip_prefix("m:") {
+            return self.pane_marker.iter().find(|(_, v)| v.as_str() == m).map(|(id, _)| *id);
+        }
+        key.strip_prefix("p:")?.parse().ok().filter(|id| self.pane_tab.contains_key(id))
+    }
+
+    /// Add the pane of the selected row (a tab row: its focused pane) to the
+    /// favorites, or take it off.
+    fn toggle_favorite(&mut self, idx: usize) -> bool {
+        let id = match self.build_rows().get(idx) {
+            Some(Row::Pane { id, .. }) => *id,
+            Some(Row::Tab { position, .. }) => {
+                let Some(ps) = self.tab_panes.get(position) else { return false };
+                let Some(p) = ps.iter().find(|p| p.2).or(ps.first()) else { return false };
+                p.0
+            }
+            _ => return false,
+        };
+        let key = self.favorite_key(id);
+        let before = self.favorites.len();
+        let kept: Vec<String> =
+            self.favorites.iter().filter(|k| **k != key && self.favorite_pane(k) != Some(id)).cloned().collect();
+        self.favorites = kept;
+        if self.favorites.len() == before {
+            self.favorites.push(key);
+        }
+        vlog!("favorite pane={} now={:?}", id, self.favorites);
+        if let Some(s) = &self.session {
+            let _ = std::fs::write(format!("{}{}", FAVORITES_FILE_PREFIX, s), self.favorites.join("\n"));
+        }
+        true
+    }
+
+    fn load_favorites(&mut self) {
+        let Some(s) = &self.session else { return };
+        if let Ok(text) = std::fs::read_to_string(format!("{}{}", FAVORITES_FILE_PREFIX, s)) {
+            self.favorites = text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+        }
     }
 
     /// The folded `⎇ worktrees (N)` row of repo `main` and, unfolded, its
@@ -1617,6 +1745,7 @@ impl State {
         let b = self.pane_background.remove(&id).is_some();
         let c = self.pane_unread.remove(&id);
         self.pane_exited.remove(&id);
+        self.pane_marker.remove(&id);
         if self.last_titles.remove(&id).is_some() {
             self.titles_dirty = true;
         }
@@ -2134,6 +2263,7 @@ impl State {
             BareKey::Char('=') | BareKey::Char('+') => self.change_width(true),
             BareKey::Char('0') => self.toggle_collapse(),
             BareKey::Char('m') | BareKey::Char('ь') => self.start_move(),
+            BareKey::Char('f') | BareKey::Char('а') => self.toggle_favorite(self.selected),
             BareKey::Char('v') | BareKey::Char('м') => {
                 self.toggle_view();
                 true
@@ -2301,6 +2431,7 @@ impl State {
                 "↑↓ select  Enter go",
                 "←→ fold  ⇧↑↓ reorder",
                 "r rename  m to session",
+                "f favorite (right click)",
                 "v by state  -= width",
                 "Esc exit",
             ]
@@ -2549,6 +2680,18 @@ impl State {
         self.activate(idx);
     }
 
+    /// Index of the row drawn on screen line `row`: the favorites stay on top,
+    /// the rest is the scrolled window (see frame).
+    fn row_at(&self, row: isize, len: usize) -> Option<usize> {
+        let r = row - TOP_PAD as isize;
+        if r < 0 {
+            return None;
+        }
+        let head = self.fav_rows_n.get();
+        let idx = if (r as usize) < head { r as usize } else { r as usize + self.scroll_top };
+        (idx < len).then_some(idx)
+    }
+
     fn handle_mouse(&mut self, mouse: Mouse) -> bool {
         if self.renaming.take().is_some() {
             self.rename_back = 0;
@@ -2559,12 +2702,12 @@ impl State {
             return false;
         }
         match mouse {
+            Mouse::RightClick(row, _) => match self.row_at(row, len) {
+                Some(idx) => self.toggle_favorite(idx),
+                None => false,
+            },
             Mouse::LeftClick(row, col) => {
-                let idx = row - TOP_PAD as isize + self.scroll_top as isize;
-                if idx < 0 || idx as usize >= len {
-                    return false;
-                }
-                let idx = idx as usize;
+                let Some(idx) = self.row_at(row, len) else { return false };
                 let rows = self.build_rows();
                 if let Row::Group { name, depth, .. } = &rows[idx] {
                     vlog!("group click my_id={} my_tab={:?} row={} col={} group={} keys_on={}", self.my_id, self.my_tab, idx, col, name, self.keys_on);
@@ -2715,6 +2858,7 @@ impl State {
                     if self.role == Role::Brain {
                         self.load_unread();
                         self.load_titles();
+                        self.load_favorites();
                         self.load_worktrees();
                     }
                     return true;
@@ -2882,6 +3026,9 @@ impl State {
                     for p in panes {
                         if !p.is_plugin {
                             self.pane_tab.insert(p.id, *tab_pos);
+                            if let Some(m) = p.terminal_command.as_deref().and_then(zellij_marker) {
+                                self.pane_marker.insert(p.id, m);
+                            }
                             if p.is_focused && !p.is_floating {
                                 focused_terminal.get_or_insert((*tab_pos, p.id));
                             }
@@ -3071,6 +3218,7 @@ impl State {
                     self.sync_width(false);
                     self.load_unread();
                     self.load_titles();
+                    self.load_favorites();
                     self.mark_focused_read();
                 }
                 self.ensure_timer();
@@ -3525,10 +3673,14 @@ impl State {
             (None, Some(h)) if !narrow => h.len() + 1,
             _ => 0,
         };
-        let fit = rows.saturating_sub(TOP_PAD + 1 + footer).max(1);
-        self.scroll_top = scroll_window(self.scroll_top, self.selected, visible.len(), fit);
+        // the favorites on top stay put; the window scrolls the rows below them
+        let head = self.fav_rows_n.get().min(visible.len());
+        let fit = rows.saturating_sub(TOP_PAD + 1 + footer + head).max(1);
+        let sel = if self.selected >= head { self.selected - head } else { self.scroll_top };
+        self.scroll_top = scroll_window(self.scroll_top, sel, visible.len() - head, fit);
         let top = self.scroll_top;
-        for (i, row) in visible.iter().enumerate().skip(top).take(fit) {
+        let shown = visible.iter().enumerate().take(head).chain(visible.iter().enumerate().skip(head + top).take(fit));
+        for (i, row) in shown {
             let core = if narrow {
                 match row {
                     Row::Group { collapsed: true, attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
@@ -3579,7 +3731,7 @@ impl State {
                             format!("{}  {}{}{}{}", indent, fold_mark(*fold), slot, label, bell)
                         }
                     }
-                    Row::Pane { id, title, depth, focused, last, flat, attention, unread } => {
+                    Row::Pane { id, title, depth, focused, last, flat, fav, attention, unread } => {
                         let indent = "  ".repeat(*depth);
                         let branch = if *last { "└" } else { "├" };
                         let icon = self.state_slot(*attention, *unread, self.background_of([id]));
@@ -3597,7 +3749,10 @@ impl State {
                             None => title.to_string(),
                         };
                         let title = title.as_str();
-                        if *flat {
+                        if *fav {
+                            let star = if *focused { "\u{1b}[33m★\u{1b}[39m" } else { "\u{1b}[2m★\u{1b}[22m" };
+                            format!("  {} {}{}", star, icon, title)
+                        } else if *flat {
                             let dot = if *focused { "●" } else { " " };
                             format!("  {} {}{}", dot, icon, title)
                         } else if *focused {
@@ -3764,6 +3919,18 @@ fn pane_title(last: &mut BTreeMap<u32, String>, dirty: &mut bool, id: u32, raw: 
         *dirty = true;
     }
     t
+}
+
+/// The claude-zellij marker in a pane's command line (`--zellij-marker <uuid>`
+/// of the wrapper, `--marker <uuid>` of its PTY helper).
+fn zellij_marker(cmd: &str) -> Option<String> {
+    let mut words = cmd.split_whitespace();
+    while let Some(w) = words.next() {
+        if w == "--zellij-marker" || w == "--marker" {
+            return words.next().map(str::to_string);
+        }
+    }
+    None
 }
 
 fn strip_claude_glyph(title: &str) -> &str {
@@ -4060,6 +4227,45 @@ mod tests {
         assert!(!is_default_tab_name("Tab #"));
         assert!(!is_default_tab_name("Tab #1x"));
         assert!(!is_default_tab_name("work:api"));
+    }
+
+    #[test]
+    fn favorites_list_on_top_with_the_active_tab_panes_under() {
+        assert_eq!(
+            zellij_marker("python3 h.py --wrapper w --marker abc -- claude --resume x").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(zellij_marker("bash"), None);
+        let mut s = State {
+            tab_panes: [
+                (0, vec![(1, "✳ wsa".to_string(), true), (2, "wsa-vps".to_string(), false)]),
+                (1, vec![(3, "rosatom".to_string(), true)]),
+            ]
+            .into(),
+            pane_tab: [(1, 0), (2, 0), (3, 1)].into(),
+            pane_marker: [(1, "m1".to_string())].into(),
+            pane_attention: [(2, Attention::Waiting)].into(),
+            waiting_icon: "?".into(),
+            ..Default::default()
+        };
+        s.favorites = vec![s.favorite_key(1), s.favorite_key(3)];
+        assert_eq!(s.favorites, ["m:m1", "p:3"]);
+        let tabs = [
+            TabItem { position: 0, label: "wsa".into(), active: true, attention: None },
+            TabItem { position: 1, label: "rosatom".into(), active: false, attention: None },
+        ];
+        let rows = s.favorite_rows(tabs.iter());
+        let ids: Vec<(u32, bool)> = rows
+            .iter()
+            .map(|r| match r {
+                Row::Pane { id, fav, .. } => (*id, *fav),
+                _ => panic!(),
+            })
+            .collect();
+        // wsa's other pane is under it: the tab is active
+        assert_eq!(ids, [(1, true), (2, false), (3, true)]);
+        // the favorite row counts the pane that waits
+        assert!(matches!(&rows[0], Row::Pane { title, .. } if title.contains("?1")));
     }
 
     #[test]
