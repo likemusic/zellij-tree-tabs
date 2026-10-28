@@ -864,8 +864,76 @@ enum RenameTarget {
 
 // The plugin entry points call zellij-tile's wasm host imports, which don't exist
 // on the host target — gate them out of `cargo test` so the pure logic can be tested.
+// zellij-tile's register_plugin!, except that an event this zellij-tile can't
+// decode is skipped (local change): Zellij 0.45 sends mouse events 0.44 doesn't
+// know (a horizontal touchpad scroll), and the macro's unwrap killed the plugin.
 #[cfg(not(test))]
-register_plugin!(State);
+mod entry {
+    use super::State;
+    use zellij_tile::prelude::*;
+
+    thread_local! {
+        static STATE: std::cell::RefCell<State> = std::cell::RefCell::new(Default::default());
+    }
+
+    #[no_mangle]
+    fn load() {
+        STATE.with(|state| {
+            use std::collections::BTreeMap;
+            use zellij_tile::shim::plugin_api::action::ProtobufPluginConfiguration;
+            use zellij_tile::shim::prost::Message;
+            let protobuf_bytes: Vec<u8> = zellij_tile::shim::object_from_stdin().unwrap();
+            let protobuf_configuration: ProtobufPluginConfiguration =
+                ProtobufPluginConfiguration::decode(protobuf_bytes.as_slice()).unwrap();
+            let plugin_configuration: BTreeMap<String, String> =
+                BTreeMap::try_from(&protobuf_configuration).unwrap();
+            state.borrow_mut().load(plugin_configuration);
+        });
+    }
+
+    #[no_mangle]
+    pub fn update() -> bool {
+        use zellij_tile::shim::plugin_api::event::ProtobufEvent;
+        use zellij_tile::shim::prost::Message;
+        STATE.with(|state| {
+            let Ok(protobuf_bytes) = zellij_tile::shim::object_from_stdin::<Vec<u8>>() else { return false };
+            let Ok(protobuf_event) = ProtobufEvent::decode(protobuf_bytes.as_slice()) else { return false };
+            let Ok(event) = Event::try_from(protobuf_event) else { return false };
+            state.borrow_mut().update(event)
+        })
+    }
+
+    #[no_mangle]
+    pub fn pipe() -> bool {
+        use zellij_tile::shim::plugin_api::pipe_message::ProtobufPipeMessage;
+        use zellij_tile::shim::prost::Message;
+        STATE.with(|state| {
+            let Ok(protobuf_bytes) = zellij_tile::shim::object_from_stdin::<Vec<u8>>() else { return false };
+            let Ok(message) = ProtobufPipeMessage::decode(protobuf_bytes.as_slice()) else { return false };
+            let Ok(pipe_message) = PipeMessage::try_from(message) else { return false };
+            state.borrow_mut().pipe(pipe_message)
+        })
+    }
+
+    #[no_mangle]
+    pub fn render(rows: i32, cols: i32) {
+        STATE.with(|state| {
+            state.borrow_mut().render(rows as usize, cols as usize);
+        });
+    }
+
+    #[no_mangle]
+    pub fn plugin_version() {
+        println!("{}", zellij_tile::prelude::VERSION);
+    }
+}
+
+#[cfg(not(test))]
+fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        zellij_tile::prelude::report_panic(info);
+    }));
+}
 
 /// A tab within a group, while building the tree.
 struct TabItem {
@@ -3792,12 +3860,14 @@ impl State {
                         // an exited pane Zellij holds: Enter in it runs the command again
                         let title = match self.pane_exited.get(id) {
                             Some(code) => {
+                                // a pause, not an error: Enter in the pane resumes the session;
+                                // only a failed exit keeps its code
                                 let what = match code {
-                                    Some(c) if *c != 0 => format!("exit {}", c),
-                                    _ => "exited".to_string(),
+                                    Some(c) if *c != 0 => format!(" · exit {}", c),
+                                    _ => String::new(),
                                 };
-                                let sep = if title.is_empty() { "" } else { " · " };
-                                format!("\u{1b}[31m✗\u{1b}[39m {}{}\u{1b}[2m{}\u{1b}[22m", title, sep, what)
+                                let title = if title.is_empty() { "closed" } else { title };
+                                format!("\u{1b}[2m‖ {}{}\u{1b}[22m", title, what)
                             }
                             None => title.to_string(),
                         };
