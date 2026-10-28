@@ -158,14 +158,15 @@ fn tab_fold_key(label: &str) -> String {
     format!("tab:{}", label)
 }
 
-/// ▼/▶ before a tab's label when it has rows of its own (see `Row::Tab`);
-/// a dim · in the same column for the others, so every tab of a group starts
-/// at one column and the group's shape shows.
+/// ▾/▸ before a tab's label when it has rows of its own (see `Row::Tab`);
+/// a • in the same column for the others, so every tab of a group starts at
+/// one column and the group's shape shows. The small triangles weigh about
+/// as much as the dot; groups keep the big ▼/▶.
 fn fold_mark(fold: Option<bool>) -> &'static str {
     match fold {
-        Some(true) => "▶ ",
-        Some(false) => "▼ ",
-        None => "\u{1b}[2m·\u{1b}[22m ",
+        Some(true) => "▸ ",
+        Some(false) => "▾ ",
+        None => "\u{1b}[2m•\u{1b}[22m ",
     }
 }
 
