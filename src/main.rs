@@ -582,6 +582,10 @@ struct State {
     /// session name (from ModeUpdate) — state persistence is a no-op until known
     session: Option<String>,
     selected: usize,
+    /// First row drawn when the list is taller than the pane (local change):
+    /// the frame shows a window that keeps `selected` in view, and a click's
+    /// screen row is mapped back through it.
+    scroll_top: usize,
     separator: char,
     waiting_icon: String,
     completed_icon: String,
@@ -2475,10 +2479,11 @@ impl State {
             }
         };
         vlog!(
-            "click my_id={} my_tab={:?} row={} tab={:?} tab_id={:?} pane={:?} keys_on={}",
+            "click my_id={} my_tab={:?} row={} top={} tab={:?} tab_id={:?} pane={:?} keys_on={}",
             self.my_id,
             self.my_tab,
             idx,
+            self.scroll_top,
             target.0,
             target.0.and_then(|p| self.tabs.iter().find(|t| t.position == p)).map(|t| t.tab_id),
             target.1,
@@ -2507,7 +2512,7 @@ impl State {
         }
         match mouse {
             Mouse::LeftClick(row, col) => {
-                let idx = row - TOP_PAD as isize;
+                let idx = row - TOP_PAD as isize + self.scroll_top as isize;
                 if idx < 0 || idx as usize >= len {
                     return false;
                 }
@@ -3451,7 +3456,17 @@ impl State {
         // collapsed sidebar (local change): only the state icons, one per row
         // the brain's width_saved is the active tab's, not this pane's
         let narrow = self.width_saved.is_some() && self.role != Role::Brain || cols < NARROW_COLS;
-        for (i, row) in visible.iter().enumerate() {
+        // a list taller than the pane would scroll the pane's terminal and shift
+        // every click by the overflow: draw only the window around the selection
+        let footer = match (&self.moving, self.key_hints()) {
+            (Some(_), _) => self.sessions.len().min(9) + 3,
+            (None, Some(h)) if !narrow => h.len() + 1,
+            _ => 0,
+        };
+        let fit = rows.saturating_sub(TOP_PAD + 1 + footer).max(1);
+        self.scroll_top = scroll_window(self.scroll_top, self.selected, visible.len(), fit);
+        let top = self.scroll_top;
+        for (i, row) in visible.iter().enumerate().skip(top).take(fit) {
             let core = if narrow {
                 match row {
                     Row::Group { collapsed: true, attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
@@ -3608,6 +3623,22 @@ impl ZellijPlugin for State {
     }
 }
 
+/// First row to draw so that `selected` stays within `fit` rows of a `len`-row
+/// list, moving the previous window `top` as little as possible.
+fn scroll_window(top: usize, selected: usize, len: usize, fit: usize) -> usize {
+    if len <= fit {
+        return 0;
+    }
+    let top = top.min(len - fit);
+    if selected < top {
+        selected
+    } else if selected >= top + fit {
+        selected + 1 - fit
+    } else {
+        top
+    }
+}
+
 /// Single-quote a string for `sh -c` (local change: session names in the move command).
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -3705,6 +3736,16 @@ fn truncate_visible(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scroll_window_keeps_selection_in_view() {
+        use super::scroll_window;
+        assert_eq!(scroll_window(5, 3, 10, 20), 0); // fits: no scroll
+        assert_eq!(scroll_window(0, 10, 70, 60), 0); // in view: stays
+        assert_eq!(scroll_window(0, 65, 70, 60), 6); // below: last row at the bottom
+        assert_eq!(scroll_window(8, 4, 70, 60), 4); // above: first row at the top
+        assert_eq!(scroll_window(30, 69, 70, 60), 10); // shrunk list: clamped
+    }
+
     use super::*;
 
     #[test]
