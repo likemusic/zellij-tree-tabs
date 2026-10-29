@@ -1545,8 +1545,37 @@ impl State {
             self.favorites.push(key);
         }
         vlog!("favorite pane={} now={:?}", id, self.favorites);
+        self.save_favorites();
+        true
+    }
+
+    fn save_favorites(&self) {
         if let Some(s) = &self.session {
             let _ = std::fs::write(format!("{}{}", FAVORITES_FILE_PREFIX, s), self.favorites.join("\n"));
+        }
+    }
+
+    /// Swap favorite `id` with the favorite listed above/below it (persisted),
+    /// so the most important ones can go to the top; the selection follows.
+    fn move_favorite(&mut self, rows: &[Row], id: u32, delta: isize) -> bool {
+        let shown: Vec<u32> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Pane { id, fav: true, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let Some(i) = shown.iter().position(|p| *p == id) else { return false };
+        let j = i as isize + delta;
+        if j < 0 || j as usize >= shown.len() {
+            return false;
+        }
+        let key_at = |s: &Self, p: u32| s.favorites.iter().position(|k| s.favorite_pane(k) == Some(p));
+        let (Some(a), Some(b)) = (key_at(self, id), key_at(self, shown[j as usize])) else { return false };
+        self.favorites.swap(a, b);
+        self.save_favorites();
+        if let Some(idx) = self.build_rows().iter().position(|r| matches!(r, Row::Pane { id: p, fav: true, .. } if *p == id)) {
+            self.selected = idx;
         }
         true
     }
@@ -2090,9 +2119,12 @@ impl State {
             return false;
         }
         let rows = self.build_rows();
-        // the sections on top keep their order
+        // in the sections on top only a favorite moves, among the favorites
         if self.selected < self.fav_rows_n.get() {
-            return false;
+            return match rows.get(self.selected) {
+                Some(Row::Pane { id, fav: true, .. }) => self.move_favorite(&rows, *id, delta),
+                _ => false,
+            };
         }
         // a pane row (where the bar lands after a click on its tab) moves its tab
         if let Some(Row::Pane { id, fav: false, .. }) = rows.get(self.selected) {
@@ -4793,6 +4825,14 @@ mod tests {
         assert!(matches!(&s.waiting_rows(marked.iter())[..], [Row::Pane { id: 3, .. }]));
         s.pane_attention.clear();
         assert_eq!(heads(&s), ["Favorites 2"]);
+
+        // a favorite moves among the favorites, the selection with it
+        s.collapsed.clear();
+        let rows = s.section_rows(tabs.iter());
+        s.selected = 2;
+        assert!(!s.move_favorite(&rows, 1, -1));
+        assert!(s.move_favorite(&rows, 1, 1));
+        assert_eq!(s.favorites, ["p:3", "m:m1"]);
     }
 
     #[test]
