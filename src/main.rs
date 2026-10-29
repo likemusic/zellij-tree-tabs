@@ -4065,6 +4065,8 @@ impl State {
             _ => None,
         };
         let payload = msg.payload.clone().unwrap_or_default();
+        // a screen's mouse or key: logged as such, with what it was
+        self.sel_cause = format!("pipe {} {}", msg.name, payload);
         match msg.name.as_str() {
             "vtabs-hello" | "vtabs-shown" => {
                 let Some(id) = from else { return false };
