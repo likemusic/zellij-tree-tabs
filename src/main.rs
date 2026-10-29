@@ -1314,7 +1314,9 @@ impl State {
                 .fold((0, None), |(n, acc), it| {
                     (n + 1, it.attention.map_or(acc, |x| Some(merge(acc, x))))
                 });
-            let collapsed = self.collapsed.contains(&node.path);
+            let stopped = node.depth > 0
+                && items.iter().filter(|(g, _)| in_subtree(g)).flat_map(|(_, its)| its).all(|it| self.tab_exited(it.position));
+            let collapsed = self.folded(&node.path, stopped);
             let unread = items
                 .iter()
                 .filter(|(g, _)| in_subtree(g))
@@ -1340,7 +1342,7 @@ impl State {
                 let listed = panes.filter(|p| p.len() > 1 || self.show_single_pane && !p.is_empty());
                 let main = self.tab_cwd.get(&it.position).and_then(|c| self.cwd_repo.get(c).filter(|m| *m == c));
                 let main = main.filter(|m| !repos_shown.contains(m) && !self.closed_worktrees(m).is_empty()).cloned();
-                let folded = self.collapsed.contains(&tab_fold_key(&it.label));
+                let folded = self.folded(&tab_fold_key(&it.label), self.tab_exited(it.position));
                 rows.push(Row::Tab {
                     position: it.position,
                     label: it.label,
@@ -2128,13 +2130,9 @@ impl State {
             return false;
         }
         match &rows[idx] {
-            Row::Group { name, .. } => {
-                if self.collapsed.contains(name) {
-                    self.collapsed.remove(name);
-                } else {
-                    self.collapsed.insert(name.clone());
-                }
-                self.save_state();
+            Row::Group { name, collapsed, .. } => {
+                let (name, folded) = (name.clone(), !*collapsed);
+                self.set_folded(&name, folded);
                 true
             }
             Row::Tab { position, .. } => {
@@ -2267,7 +2265,10 @@ impl State {
         self.group_order.retain(|g| seen.insert(g.clone()));
         self.collapsed = std::mem::take(&mut self.collapsed)
             .into_iter()
-            .map(|g| moved(&g).unwrap_or(g))
+            .map(|g| match g.strip_prefix("open:") {
+                Some(p) => moved(p).map(|n| format!("open:{}", n)).unwrap_or(g),
+                None => moved(&g).unwrap_or(g),
+            })
             .collect();
         for (g, order) in std::mem::take(&mut self.tab_order) {
             let key = moved(&g).unwrap_or(g);
@@ -2717,10 +2718,57 @@ impl State {
         }
     }
 
+    /// Whether a group or tab is folded (local change). Folded by default — a
+    /// nested group, a tab whose panes all stopped — it is open only while
+    /// `open:<key>` is in `collapsed`; else folded while `<key>` is there.
+    fn folded(&self, key: &str, by_default: bool) -> bool {
+        if by_default {
+            !self.collapsed.contains(&format!("open:{}", key))
+        } else {
+            self.collapsed.contains(key)
+        }
+    }
+
+    /// Folded by default: a tab whose panes all stopped, a group below the top
+    /// level whose tabs all are (sections, status groups, worktree lists have
+    /// their own rules).
+    fn fold_default(&self, key: &str) -> bool {
+        if let Some(label) = key.strip_prefix("tab:") {
+            return self
+                .grouped_items()
+                .into_iter()
+                .flat_map(|(_, items)| items)
+                .any(|it| it.label == label && self.tab_exited(it.position));
+        }
+        let nested = self.build_rows().iter().any(|r| matches!(r, Row::Group { name, depth, .. } if name == key && *depth > 0));
+        let prefix = format!("{}/", key);
+        !self.status_view
+            && nested
+            && self
+                .grouped_items()
+                .into_iter()
+                .filter(|(g, _)| g == key || g.starts_with(&prefix))
+                .flat_map(|(_, items)| items)
+                .all(|it| self.tab_exited(it.position))
+    }
+
     /// Fold or unfold a group, a worktree list or a tab (`tab_fold_key`). A
     /// worktree list is folded by default: its key in `collapsed` means open.
     fn set_folded(&mut self, key: &str, folded: bool) {
-        if folded != key.contains('⎇') {
+        if key.contains('⎇') {
+            if folded {
+                self.collapsed.remove(key);
+            } else {
+                self.collapsed.insert(key.to_string());
+            }
+        } else if self.fold_default(key) {
+            let open = format!("open:{}", key);
+            if folded {
+                self.collapsed.remove(&open);
+            } else {
+                self.collapsed.insert(open);
+            }
+        } else if folded {
             self.collapsed.insert(key.to_string());
         } else {
             self.collapsed.remove(key);
@@ -4982,6 +5030,16 @@ mod tests {
         assert_eq!(fold_mark_count(Some(true), 0), "▸ ");
         assert_eq!(fold_mark_count(Some(true), 1), "▸1");
         assert_eq!(fold_mark_count(None, 1), fold_mark(None));
+    }
+
+    #[test]
+    fn folded_by_default_opens_by_its_own_key() {
+        let mut s = State::default();
+        assert!(s.folded("a/b", true) && !s.folded("a/b", false));
+        s.collapsed.insert("open:a/b".to_string());
+        assert!(!s.folded("a/b", true), "opened by hand");
+        s.migrate_group_state("a", "c");
+        assert!(s.collapsed.contains("open:c/b"), "the open mark follows a rename");
     }
 
     #[test]
