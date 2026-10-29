@@ -1,10 +1,14 @@
 # zellij-tree-tabs
 
-A vertical, grouped, collapsible tab sidebar for [Zellij](https://zellij.dev) — with attention indicators driven by Claude Code.
+A tree sidebar for [Zellij](https://zellij.dev): tabs grouped into a collapsible tree, each tab's panes under it, favorites on top, a keyboard mode, and Claude Code session state (waiting, working, done, unread) on every pane, tab and folded group.
 
-## This fork
+![zellij-tree-tabs sidebar](docs/screenshot.png)
 
-`zellij-tree-tabs` is a fork of [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs), used daily with many Claude Code sessions in one Zellij session (Zellij 0.45, Windows Terminal + WSL). Everything below this section is the upstream README; the changes on the `local` branch are:
+Install: [Build & install](#build--install). Bugs and ideas: [issues](https://github.com/likemusic/zellij-tree-tabs/issues), questions: [discussions](https://github.com/likemusic/zellij-tree-tabs/discussions).
+
+## What it adds to zellij-vtabs
+
+`zellij-tree-tabs` grew out of [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs), which its author keeps as a personal tool. It is used daily with dozens of Claude Code sessions in one Zellij session (Zellij 0.45, Windows Terminal + WSL). The sections after this one describe the base plugin; on top of it:
 
 - **Pane list under each tab** with two or more panes, titles refreshed every 2 s (Claude's own session titles show up there), stacked panes included (Zellij reports a stack's collapsed panes as suppressed); `show_single_pane "true"` lists a lone pane too.
 - **Per-pane state icons**: the same `waiting` / `working` / `completed` pipes mark the pane row, not only the tab. Marks are the session's state, not unread cues: looking at a tab or pane does not clear them, only the next signal does (`clear-working` on SessionEnd clears all).
@@ -25,20 +29,11 @@ A vertical, grouped, collapsible tab sidebar for [Zellij](https://zellij.dev) �
 
 The plugin file, pipe names and config keys keep the upstream name `zellij-vtabs` (`zellij-vtabs.wasm`, `zellij-vtabs::<signal>::<pane>`), so existing configs keep working. Setup is the same as upstream below; [Claude Code integration](#claude-code-integration) lists the hooks, including the fork's `PostToolUse` and compact hooks.
 
-> ⚠️ **This is a personal tool, built for my own setup — not a general-purpose plugin.**
-> It hardcodes assumptions about *my* workflow: my plugin path, my `:`-based tab-naming
-> convention, my Zellij version, my Claude Code hooks. It is published for my own reuse
-> across machines, not as something meant to work out-of-the-box for anyone else. There
-> are no stability guarantees, no issue tracker, and no intention to generalize it. If you
-> stumbled on this: feel free to read/fork, but expect to change paths and conventions to
-> fit your own environment.
 
 ## What it does
 
 Zellij has no native vertical tabs. This plugin renders a left sidebar showing tabs as a
-**collapsible tree grouped by name prefix**, so I can keep many tabs organized at a glance:
-
-![zellij-vtabs sidebar](docs/screenshot.png)
+**collapsible tree grouped by name prefix**, so many tabs stay organized at a glance.
 
 Groups (`▼`/`▶`) collapse and expand; `◆` (yellow) marks a tab needing input, `✓` (green) a
 finished one, and `●` marks the active tab. A `✓` is bright and bold while unread — the
@@ -68,7 +63,7 @@ pipe marks a pane read (used when restoring marks after a plugin reload).
 - **Mouse**: left-click to switch/toggle, scroll to move the selection.
 - **Active tab** marked with `●`; the selection highlight follows it.
 - **Attention icons** — `◆` (yellow, needs input) and `✓` (green, done), appearing on the
-  tab and **rolling up to a collapsed group's header**. Cleared automatically when I focus
+  tab and **rolling up to a collapsed group's header**. Cleared automatically when you focus
   the tab. Wired to Claude Code's `Notification`/`Stop` hooks.
 - **Working spinner** — an animated cyan spinner while Claude is running in a tab (wired
   to the `UserPromptSubmit` hook). Unlike the attention icons it shows on the active tab
@@ -79,7 +74,7 @@ pipe marks a pane read (used when restoring marks after a plugin reload).
 
 - **Zellij ≥ the `zellij-tile` version the wasm was built with** — release builds use
   `0.44.2`, and the prebuilt wasm is verified working on Zellij **0.43.1, 0.44.2, and
-  0.44.3** (the protobuf plugin API tolerates version skew in both directions better than
+  0.44.3**, and used daily on **0.45.1** (the protobuf plugin API tolerates version skew in both directions better than
   Zellij's error messages suggest; a plugin built against a *newer* `zellij-tile` than the
   running Zellij is the combination that reliably fails).
 - **Building from source:** Rust + `cargo` with the `wasm32-wasip1` target
@@ -95,7 +90,7 @@ this as `try-vtabs.kdl`:
 layout {
     pane split_direction="vertical" {
         pane size=28 borderless=true {
-            plugin location="https://github.com/otezz/zellij-vtabs/releases/latest/download/zellij-vtabs.wasm"
+            plugin location="https://github.com/likemusic/zellij-tree-tabs/releases/latest/download/zellij-vtabs.wasm"
         }
         pane
     }
@@ -109,10 +104,12 @@ Pre-seed the permissions in `~/.cache/zellij/permissions.kdl` (the in-pane grant
 doesn't render usably in a 28-column sidebar):
 
 ```kdl
-"https://github.com/otezz/zellij-vtabs/releases/latest/download/zellij-vtabs.wasm" {
+"https://github.com/likemusic/zellij-tree-tabs/releases/latest/download/zellij-vtabs.wasm" {
     ReadApplicationState
     ChangeApplicationState
     ReadCliPipes
+    MessageAndLaunchOtherPlugins
+    RunCommands
 }
 ```
 
@@ -127,11 +124,11 @@ cp target/wasm32-wasip1/release/zellij-vtabs.wasm ~/.config/zellij/plugins/zelli
 ```
 
 Or skip the Rust toolchain and grab the prebuilt `zellij-vtabs.wasm` from the
-[latest release](https://github.com/otezz/zellij-vtabs/releases/latest):
+[latest release](https://github.com/likemusic/zellij-tree-tabs/releases/latest):
 
 ```bash
 curl -Lo ~/.config/zellij/plugins/zellij-vtabs.wasm \
-  https://github.com/otezz/zellij-vtabs/releases/latest/download/zellij-vtabs.wasm
+  https://github.com/likemusic/zellij-tree-tabs/releases/latest/download/zellij-vtabs.wasm
 ```
 
 Pre-seed the plugin's permissions (Zellij's in-pane grant prompt doesn't render usably in a
@@ -143,6 +140,8 @@ absolute** path, so use your real home dir here (not `~`):
     ReadApplicationState
     ChangeApplicationState
     ReadCliPipes
+    MessageAndLaunchOtherPlugins
+    RunCommands
 }
 ```
 
@@ -151,6 +150,16 @@ and set it as the default in `~/.config/zellij/config.kdl`:
 
 ```kdl
 default_layout "vtabs"
+```
+
+and load the background instance that keeps the state for every tab's sidebar (see [One brain, a screen per tab](#one-brain-a-screen-per-tab)), with the same absolute path:
+
+```kdl
+load_plugins {
+    "file:/home/<you>/.config/zellij/plugins/zellij-vtabs.wasm" {
+        role "brain"
+    }
+}
 ```
 
 Fast dev loop (code-only changes — layout/config changes still need a fresh session):

@@ -1808,7 +1808,8 @@ impl State {
     fn load_worktrees(&mut self) {
         let Some(session) = &self.session else { return };
         let Ok(s) = std::fs::read_to_string(format!("{}{}", WORKTREES_FILE_PREFIX, session)) else { return };
-        let (mut repos, mut lists): (BTreeMap<String, String>, BTreeMap<String, Vec<(String, String)>>) = Default::default();
+        let mut repos: BTreeMap<String, String> = BTreeMap::new();
+        let mut lists: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for line in s.lines() {
             let f: Vec<&str> = line.split('\t').collect();
             match f.as_slice() {
@@ -2338,8 +2339,8 @@ impl State {
             }
             Some(Row::Pane { id, .. }) => {
                 let tab = self.pane_tab.get(id).copied();
-                if tab.is_some() && tab != self.my_tab {
-                    self.browse_to(tab.unwrap(), Some(*id));
+                if let Some(t) = tab.filter(|t| Some(*t) != self.my_tab) {
+                    self.browse_to(t, Some(*id));
                 } else {
                     self.highlight(Some(*id));
                     self.expand_if_stacked(Some(*id));
@@ -4036,7 +4037,7 @@ impl State {
                             // a single-pane tab lists no pane row: its ★ takes the • of the tab
                             let single = self.tab_panes.get(position).filter(|ps| ps.len() == 1);
                             let mark = match single {
-                                Some(ps) if *fold == None && self.is_favorite(ps[0].0) => "\u{1b}[33m★\u{1b}[39m ",
+                                Some(ps) if fold.is_none() && self.is_favorite(ps[0].0) => "\u{1b}[33m★\u{1b}[39m ",
                                 _ => fold_mark(*fold),
                             };
                             format!("{}  {}{}{}", indent, mark, slot, label)
@@ -4131,7 +4132,7 @@ impl State {
             // the sidebar's keys at its bottom while it has them (local change):
             // Zellij's status bar is another plugin and can't list them
             let used = out.matches("\r\n").count();
-            if !narrow && rows >= used + hints.len() + 1 {
+            if !narrow && rows > used + hints.len() {
                 out.push_str(&"\r\n".repeat(rows - used - hints.len()));
                 for (i, l) in hints.iter().enumerate() {
                     out.push_str(&truncate_visible(&format!("{}\u{1b}[2m{}\u{1b}[22m", pad, l), cols));

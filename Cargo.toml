@@ -1,6 +1,6 @@
 [package]
 name = "zellij-vtabs"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "Zellij vertical sidebar: grouped tabs with collapse/expand"
 license = "MIT"
