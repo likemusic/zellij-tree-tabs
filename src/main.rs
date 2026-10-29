@@ -3311,7 +3311,9 @@ impl State {
             }
             Event::ModeUpdate(mode_info) => self.set_session(mode_info.session_name),
             Event::TabUpdate(tabs) => {
+                let was_active = self.tabs.iter().find(|t| t.active).map(|t| t.position);
                 self.tabs = tabs;
+                let same_active = was_active.is_some() && was_active == self.tabs.iter().find(|t| t.active).map(|t| t.position);
                 self.layout_pending = false;
                 if self.role == Role::Brain {
                     self.follow_active_screen();
@@ -3343,16 +3345,20 @@ impl State {
                         Some(Row::Group { .. }) | Some(Row::Worktree { .. }) => true,
                         None => false,
                     };
+                // Outside it the bar follows a switch of tab, not a TabUpdate for a
+                // renamed tab (state markers rename tabs all the time): that pulled
+                // the bar back from where the wheel took it.
+                let keep = keep || !self.keys_on && same_active;
                 if self.pending_pane.is_some() {
                     self.select_pending_pane();
                 } else if keep {
                 } else if let Some(i) = self.active_row_index() {
                     self.selected = i;
-                } else {
-                    let len = self.build_rows().len();
-                    if len > 0 && self.selected >= len {
-                        self.selected = len - 1;
-                    }
+                }
+                // rows may have gone from under a kept bar too
+                let len = self.build_rows().len();
+                if len > 0 && self.selected >= len {
+                    self.selected = len - 1;
                 }
                 self.ensure_timer();
                 true
