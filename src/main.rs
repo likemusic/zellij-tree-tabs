@@ -2122,6 +2122,12 @@ impl State {
             return;
         }
         let marker = att.map(marker_of).unwrap_or("");
+        // a typed separator gives the whole name, group included (local
+        // change): `Common:x` moves the tab to Common, as Zellij's rename would
+        if new_label.contains(self.separator) {
+            rename_tab(position as u32 + 1, format!("{}{}", marker, new_label));
+            return;
+        }
         let name = match base.rfind(self.separator) {
             None => new_label.to_string(),
             Some(i) => format!("{}{}{}", &base[..i], self.separator, new_label),
@@ -2169,8 +2175,9 @@ impl State {
             BareKey::Right => self.rename_back = (len - at).saturating_sub(1),
             BareKey::Home => self.rename_back = len,
             BareKey::End => self.rename_back = 0,
-            // separator/tab would corrupt group parsing / the state file format
-            BareKey::Char(c) if plain && !c.is_control() && c != self.separator => {
+            // a separator in a group name would corrupt the state file format;
+            // in a tab's it names the tab's group (see commit_tab_rename)
+            BareKey::Char(c) if plain && !c.is_control() && (c != self.separator || matches!(target, RenameTarget::Tab(_))) => {
                 let b = byte(at);
                 buf.insert(b, c);
             }
