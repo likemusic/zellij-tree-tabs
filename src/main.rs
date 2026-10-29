@@ -1374,6 +1374,11 @@ impl State {
         rows
     }
 
+    /// Whether pane `id` is a favorite (marked ★ in the tree too).
+    fn is_favorite(&self, id: u32) -> bool {
+        self.favorites.iter().any(|k| self.favorite_pane(k) == Some(id))
+    }
+
     /// Favorite key of a pane: its claude-zellij marker when it has one.
     fn favorite_key(&self, id: u32) -> String {
         match self.pane_marker.get(&id) {
@@ -1950,6 +1955,15 @@ impl State {
             return false;
         }
         let rows = self.build_rows();
+        // a pane row (where the bar lands after a click on its tab) moves its tab
+        if let Some(Row::Pane { id, fav: false, .. }) = rows.get(self.selected) {
+            let tab = self.pane_tab.get(id).copied();
+            let at = rows.iter().position(|r| matches!(r, Row::Tab { position, .. } if Some(*position) == tab));
+            if let Some(i) = at {
+                self.selected = i;
+                return self.move_selected(delta);
+            }
+        }
         match rows.get(self.selected) {
             Some(Row::Group { name, .. }) => {
                 let name = name.clone();
@@ -2551,7 +2565,7 @@ impl State {
                 "↑↓ select  Enter go",
                 "←→ fold  ⇧↑↓ reorder",
                 "r rename  m to session",
-                "f favorite (right click)",
+                "f favorite",
                 "v by state  -= width",
                 "Esc exit",
             ]
@@ -3760,6 +3774,7 @@ impl State {
             // every screen forwards the keybinding's message: take the active one's
             "vtabs-move" if from != Some(self.my_id) => {}
             "vtabs-key" => {
+                vlog!("key from={:?} payload={:?} keys_on={} selected={}", from, payload, self.keys_on, self.selected);
                 if let Some(key) = decode_key(&payload) {
                     self.handle_key(key);
                 }
@@ -3941,7 +3956,13 @@ impl State {
                                 self.state_slot(*attention, *unread, self.tab_background(*position))
                             };
                             let bell = if self.tab_has_bell(*position) { BELL_MARK } else { "" };
-                            format!("{}  {}{}{}{}", indent, fold_mark(*fold), slot, label, bell)
+                            // a single-pane tab lists no pane row: its ★ goes on the tab
+                            let single = self.tab_panes.get(position).filter(|ps| ps.len() == 1);
+                            let star = match single {
+                                Some(ps) if self.is_favorite(ps[0].0) => " \u{1b}[33m★\u{1b}[39m",
+                                _ => "",
+                            };
+                            format!("{}  {}{}{}{}{}", indent, fold_mark(*fold), slot, label, star, bell)
                         }
                     }
                     Row::Pane { id, title, depth, focused, last, flat, fav, attention, unread } => {
@@ -3966,6 +3987,12 @@ impl State {
                                 format!("\u{1b}[2m{}{}\u{1b}[22m", title, what)
                             }
                             None => title.to_string(),
+                        };
+                        // a favorite listed in the tree: marked, so it isn't added again
+                        let title = if !*fav && self.is_favorite(*id) {
+                            format!("{} \u{1b}[33m★\u{1b}[39m", title)
+                        } else {
+                            title
                         };
                         let title = title.as_str();
                         if *fav {
