@@ -95,6 +95,11 @@ printf '%s' "$t""#;
 /// for a claude-zellij pane (survives a restored session), else `p:<pane id>`.
 const FAVORITES_FILE_PREFIX: &str = "/cache/vtabs-fav-";
 
+/// Last known working directory of each tab, by name (local change): a tab
+/// whose panes all stopped gives none (Zellij has no process to ask), and fell
+/// into General. Lines `name\tcwd`.
+const CWDS_FILE_PREFIX: &str = "/cache/vtabs-cwds-";
+
 fn parse_groups_file(s: &str) -> Vec<(String, String)> {
     s.lines()
         .map(str::trim)
@@ -823,6 +828,8 @@ struct State {
     /// working directory per tab position: of its first pane that has one
     /// (refreshed with the titles, by the visible instance)
     tab_cwd: BTreeMap<usize, String>,
+    /// tab name (no state mark) → its last known directory (`CWDS_FILE_PREFIX`)
+    cwd_by_name: BTreeMap<String, String>,
     /// brain/screen split (local change, see `Role`)
     role: Role,
     /// a screen's brain; a screen without one works on its own (legacy)
@@ -1145,6 +1152,7 @@ impl State {
         vlog!("session my_id={} role={:?} {:?} -> {:?}", self.my_id, self.role, self.session, name);
         self.session = name;
         self.load_state();
+        self.load_cwds();
         if self.role == Role::Brain {
             self.load_unread();
             self.load_titles();
@@ -1824,14 +1832,24 @@ impl State {
     /// changed. Skipped without rules: one host call per tab every refresh.
     fn refresh_tab_cwds(&mut self) -> bool {
         let mut changed = false;
-        for (position, panes) in &self.tab_panes {
+        let mut cwds_dirty = false;
+        for (position, panes) in &self.tab_panes.clone() {
             // the first pane in a project a `dirgroup` rule knows (local change):
             // a shell left in ~ ahead of it used to put the tab in General
             let cwds: Vec<String> = panes
                 .iter()
                 .filter_map(|(id, _, _)| get_pane_cwd(PaneId::Terminal(*id)).ok().map(|p| p.to_string_lossy().into_owned()))
                 .collect();
-            let cwd = cwds.iter().find(|c| dir_group_path(&self.dir_groups, c).is_some()).or(cwds.first()).cloned();
+            let name = self.tabs.iter().find(|t| t.position == *position).map(|t| parse_attention(&t.name).1.to_string());
+            // in a project now: remembered; else the remembered one, then any
+            let live = cwds.iter().find(|c| dir_group_path(&self.dir_groups, c).is_some()).cloned();
+            if let (Some(c), Some(n)) = (&live, &name) {
+                if self.cwd_by_name.get(n) != Some(c) {
+                    self.cwd_by_name.insert(n.clone(), c.clone());
+                    cwds_dirty = true;
+                }
+            }
+            let cwd = live.or_else(|| name.as_ref().and_then(|n| self.cwd_by_name.get(n).cloned())).or(cwds.first().cloned());
             if let Some(cwd) = cwd {
                 if self.tab_cwd.get(position) != Some(&cwd) {
                     vlog!("tab cwd my_id={} tab={} cwd={} group={:?}", self.my_id, position, cwd, dir_group_path(&self.dir_groups, &cwd));
@@ -1840,7 +1858,19 @@ impl State {
                 }
             }
         }
+        if cwds_dirty {
+            if let Some(s) = &self.session {
+                let text: String = self.cwd_by_name.iter().map(|(n, c)| format!("{}\t{}\n", n, c)).collect();
+                let _ = std::fs::write(format!("{}{}", CWDS_FILE_PREFIX, s), text);
+            }
+        }
         changed
+    }
+
+    fn load_cwds(&mut self) {
+        let Some(s) = &self.session else { return };
+        let Ok(text) = std::fs::read_to_string(format!("{}{}", CWDS_FILE_PREFIX, s)) else { return };
+        self.cwd_by_name = text.lines().filter_map(|l| l.split_once('\t')).map(|(n, c)| (n.to_string(), c.to_string())).collect();
     }
 
     /// A one-pane tab is named after its pane (Claude's session name, the shell's
