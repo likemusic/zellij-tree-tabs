@@ -616,7 +616,7 @@ const STATUS_GROUPS: [&str; 4] = ["Waiting", "Working", "Done", "Idle"];
 /// Keys (in `collapsed`) and labels of the sections on top of the project
 /// view (local change). A key is never a group path: those come from a tab
 /// name or a directory and hold no '§'.
-const SECTIONS: [(&str, &str); 2] = [("§fav", "Favorites"), ("§wait", "Waiting")];
+const SECTIONS: [(&str, &str); 2] = [("§fav", "\u{1b}[33m★\u{1b}[39m Favorites"), ("§wait", "Waiting")];
 
 fn is_section(name: &str) -> bool {
     name.starts_with('§')
@@ -4334,12 +4334,12 @@ impl State {
                         };
                         let title = title.as_str();
                         if *fav {
-                            let star = if *focused { "\u{1b}[33m★\u{1b}[39m" } else { "\u{1b}[2m★\u{1b}[22m" };
                             // ▸/▾ before the ★, where a tab row has its own, folds the
                             // tab's other panes
                             let others = self.pane_tab.get(id).and_then(|t| self.tab_panes.get(t)).map_or(0, |ps| ps.len().saturating_sub(1));
                             let mark = fold_mark_count(*fav_fold, others).replace('•', " ");
-                            format!("  {}{} {}{}", mark, star, icon, title)
+                            // no ★: the section's header has it; focus is the ● on the left
+                            format!("  {}{}{}", mark, icon, title)
                         } else if *flat {
                             let dot = if *focused { "●" } else { " " };
                             format!("  {} {}{}", dot, icon, title)
@@ -4354,7 +4354,7 @@ impl State {
             };
             let pad = match row {
                 _ if narrow => "",
-                Row::Tab { active: true, .. } => "●",
+                Row::Tab { active: true, .. } | Row::Pane { fav: true, focused: true, .. } => "●",
                 // a favorite listed in the tree: marked on the left, where a long
                 // title can't push it out of the column, so it isn't added again
                 Row::Pane { id, fav: false, .. } if self.is_favorite(*id) => "\u{1b}[33m★\u{1b}[39m",
@@ -4930,7 +4930,7 @@ mod tests {
             s.section_rows(tabs.iter())
                 .iter()
                 .map(|r| match r {
-                    Row::Group { label, count, .. } => format!("{} {}", label, count),
+                    Row::Group { label, count, .. } => format!("{} {}", strip_ansi(label).trim_start_matches("★ "), count),
                     Row::Pane { id, .. } => id.to_string(),
                     _ => panic!(),
                 })
