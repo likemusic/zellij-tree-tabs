@@ -179,6 +179,18 @@ fn fav_fold_key(fav: &str) -> String {
     format!("★{}", fav)
 }
 
+/// A tab's ▾/▸ with how many panes it lists in the column after it (local
+/// change: the count was typed into tab names, and stayed there once stale).
+fn fold_mark_count(fold: Option<bool>, panes: usize) -> String {
+    match (fold, panes) {
+        (Some(f), 2..) => {
+            let n = if panes < 10 { char::from(b'0' + panes as u8) } else { '+' };
+            format!("{}{}", if f { '▸' } else { '▾' }, n)
+        }
+        _ => fold_mark(fold).to_string(),
+    }
+}
+
 /// ▾/▸ before a tab's label when it has rows of its own (see `Row::Tab`);
 /// a • in the same column for the others, so every tab of a group starts at
 /// one column and the group's shape shows. The small triangles weigh about
@@ -4235,8 +4247,8 @@ impl State {
                             // a single-pane tab lists no pane row: its ★ takes the • of the tab
                             let single = self.tab_panes.get(position).filter(|ps| ps.len() == 1);
                             let mark = match single {
-                                Some(ps) if fold.is_none() && self.is_favorite(ps[0].0) => "\u{1b}[33m★\u{1b}[39m ",
-                                _ => fold_mark(*fold),
+                                Some(ps) if fold.is_none() && self.is_favorite(ps[0].0) => "\u{1b}[33m★\u{1b}[39m ".to_string(),
+                                _ => fold_mark_count(*fold, self.tab_panes.get(position).map_or(0, Vec::len)),
                             };
                             format!("{}  {}{}{}", indent, mark, slot, label)
                         }
@@ -4880,6 +4892,15 @@ mod tests {
         assert_eq!((at(&s, 2), at(&s, 3), at(&s, 4)), (Some(2), None, Some(5)));
         s.fav_rows_n.set(0);
         assert_eq!(at(&s, 0), Some(2));
+    }
+
+    #[test]
+    fn fold_mark_counts_the_tabs_panes() {
+        assert_eq!(fold_mark_count(Some(false), 3), "▾3");
+        assert_eq!(fold_mark_count(Some(true), 12), "▸+");
+        // one pane (a fold for its worktrees only): no count
+        assert_eq!(fold_mark_count(Some(true), 1), "▸ ");
+        assert_eq!(fold_mark_count(None, 1), fold_mark(None));
     }
 
     #[test]
