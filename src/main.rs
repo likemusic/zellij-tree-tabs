@@ -712,9 +712,10 @@ struct State {
     pane_session: BTreeMap<u32, String>,
     /// rows of the favorites section at the top of the last build_rows
     fav_rows_n: std::cell::Cell<usize>,
-    /// the favorite clicked last: the bar follows the focus onto its row, not
-    /// onto the same pane's row in the tree
-    fav_pick: std::cell::Cell<Option<u32>>,
+    /// the favorite clicked last, and whether its pane has had the focus since:
+    /// the bar follows the focus onto its row, not onto the same pane's row in
+    /// the tree
+    fav_pick: std::cell::Cell<Option<(u32, bool)>>,
     /// diagnostics: the last event or pipe, and the row the last frame had
     /// the bar on — a frame with the bar elsewhere logs `sel` with its cause
     sel_cause: String,
@@ -1646,15 +1647,22 @@ impl State {
         if matches!(rows.get(self.selected), Some(Row::Pane { focused: true, .. })) {
             return Some(self.selected);
         }
-        if let Some(id) = self.fav_pick.get() {
+        if let Some((id, reached)) = self.fav_pick.get() {
             let fav = rows.iter().position(|r| matches!(r, Row::Pane { id: p, fav: true, focused: true, .. } if *p == id));
             if fav.is_some() {
+                self.fav_pick.set(Some((id, true)));
                 return fav;
             }
-            // focus went elsewhere: the pick is spent
-            if rows.iter().any(|r| matches!(r, Row::Pane { id: p, focused: true, .. } if *p != id)) {
-                self.fav_pick.set(None);
+            if !reached {
+                // the focus hasn't moved there yet (a PaneUpdate with the old
+                // focus comes first): the bar waits on the clicked favorite
+                let on_pick = matches!(rows.get(self.selected), Some(Row::Pane { id: p, fav: true, .. }) if *p == id);
+                if on_pick {
+                    return Some(self.selected);
+                }
             }
+            // focus went elsewhere after: the pick is spent
+            self.fav_pick.set(None);
         }
         if self.status_view {
             // focused is set only for the active tab's focused pane there
@@ -3078,7 +3086,7 @@ impl State {
         }
         self.selected = idx;
         self.fav_pick.set(match &rows[idx] {
-            Row::Pane { id, fav: true, .. } => Some(*id),
+            Row::Pane { id, fav: true, .. } => Some((*id, false)),
             _ => None,
         });
         self.activate(idx);
