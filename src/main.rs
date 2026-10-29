@@ -1100,8 +1100,26 @@ impl State {
         }
     }
 
+    /// Learn the session's name and read what is saved for it. True if it changed.
+    fn set_session(&mut self, name: Option<String>) -> bool {
+        if name == self.session {
+            return false;
+        }
+        vlog!("session my_id={} role={:?} {:?} -> {:?}", self.my_id, self.role, self.session, name);
+        self.session = name;
+        self.load_state();
+        if self.role == Role::Brain {
+            self.load_unread();
+            self.load_titles();
+            self.load_favorites();
+            self.load_worktrees();
+        }
+        true
+    }
+
     fn save_state(&self) {
         let Some(path) = self.state_file() else {
+            vlog!("save-state skipped: no session my_id={} role={:?} hidden={}", self.my_id, self.role, self.hidden);
             return;
         };
         let p = Persisted {
@@ -1113,7 +1131,8 @@ impl State {
             width: None,
             width_saved: None,
         };
-        let _ = std::fs::write(path, serialize_state(&p));
+        let r = std::fs::write(&path, serialize_state(&p));
+        vlog!("save-state my_id={} role={:?} path={} groups={} result={:?}", self.my_id, self.role, path, p.order.len(), r.err());
     }
 
     /// Groups in display order (the tree, depth first), each with its own tabs
@@ -3022,6 +3041,10 @@ impl State {
                 false
             }
             Event::SessionUpdate(sessions, _) => {
+                // the brain runs in the background and gets no ModeUpdate: its
+                // session name (the state, favorites, … files) comes from here
+                let current = sessions.iter().find(|s| s.is_current_session).map(|s| s.name.clone());
+                let session_changed = current.is_some() && self.set_session(current);
                 let others: Vec<String> = sessions
                     .into_iter()
                     .filter(|s| !s.is_current_session)
@@ -3029,22 +3052,9 @@ impl State {
                     .collect();
                 let changed = others != self.sessions;
                 self.sessions = others;
-                changed && self.moving.is_some()
+                session_changed || changed && self.moving.is_some()
             }
-            Event::ModeUpdate(mode_info) => {
-                if mode_info.session_name != self.session {
-                    self.session = mode_info.session_name;
-                    self.load_state();
-                    if self.role == Role::Brain {
-                        self.load_unread();
-                        self.load_titles();
-                        self.load_favorites();
-                        self.load_worktrees();
-                    }
-                    return true;
-                }
-                false
-            }
+            Event::ModeUpdate(mode_info) => self.set_session(mode_info.session_name),
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
                 self.layout_pending = false;
