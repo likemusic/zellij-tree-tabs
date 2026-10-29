@@ -3965,6 +3965,13 @@ impl State {
         let sel = if self.selected >= head { self.selected - head } else { self.scroll_top };
         self.scroll_top = scroll_window(self.scroll_top, sel, visible.len() - head, fit);
         let top = self.scroll_top;
+        // the same pane listed twice (a favorite and its row in the tree): the
+        // other row gets a soft bar, so a click on one doesn't read as the
+        // selection jumping away to the other
+        let twin = match visible.get(self.selected) {
+            Some(Row::Pane { id, .. }) => Some(*id),
+            _ => None,
+        };
         let shown = visible.iter().enumerate().take(head).chain(visible.iter().enumerate().skip(head + top).take(fit));
         for (i, row) in shown {
             let core = if narrow {
@@ -4094,6 +4101,11 @@ impl State {
                 // no dim inside the bar: dim on reverse video reads as shaded letters
                 let bar = bar.replace("\u{1b}[2m", "").replace("\u{1b}[22m", "");
                 out.push_str(&format!("\u{1b}[7m{}\u{1b}[0m", bar));
+            } else if matches!(row, Row::Pane { id, .. } if Some(*id) == twin) {
+                let w = visible_width(&line);
+                let bar = format!("{}{}", line, " ".repeat(cols.saturating_sub(w)));
+                let bar = bar.replace("\u{1b}[0m", "\u{1b}[0m\u{1b}[48;5;239m");
+                out.push_str(&format!("\u{1b}[48;5;239m{}\u{1b}[0m", bar));
             } else {
                 // truncation can cut off a closing escape (a dimmed tail) —
                 // don't let it bleed into the rows below
