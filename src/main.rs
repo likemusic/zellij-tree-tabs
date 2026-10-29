@@ -3593,7 +3593,9 @@ impl State {
                 if self.hidden && !self.keys_on {
                     return false;
                 }
-                if !self.keys_on && self.pending_pane.is_none() {
+                // only when the focus moved: PaneUpdates also come for a title
+                // or a new pane, and pulled the bar back from where the wheel took it
+                if !self.keys_on && self.pending_pane.is_none() && was_focused != self.my_focused {
                     if let Some(i) = self.active_row_index() {
                         if i != self.selected {
                             self.selected = i;
