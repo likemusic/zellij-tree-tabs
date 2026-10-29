@@ -179,11 +179,12 @@ fn fav_fold_key(fav: &str) -> String {
     format!("★{}", fav)
 }
 
-/// A tab's ▾/▸ with how many panes it lists in the column after it (local
-/// change: the count was typed into tab names, and stayed there once stale).
+/// A ▾/▸ with how many rows it folds in the column after it (local change:
+/// the count was typed into tab names, and stayed there once stale). 0: no
+/// count (a tab folding only its worktrees).
 fn fold_mark_count(fold: Option<bool>, panes: usize) -> String {
     match (fold, panes) {
-        (Some(f), 2..) => {
+        (Some(f), 1..) => {
             let n = if panes < 10 { char::from(b'0' + panes as u8) } else { '+' };
             format!("{}{}", if f { '▸' } else { '▾' }, n)
         }
@@ -4215,7 +4216,8 @@ impl State {
                         } else if name.contains('⎇') {
                             // last branch of the tab's pane tree, ▶/▼ still at 2 * depth
                             let indent = "  ".repeat(depth.saturating_sub(3));
-                            format!("{}    \u{1b}[2m└\u{1b}[22m {} {} ({})", indent, disc, label, count)
+                            let mark = fold_mark_count(Some(*collapsed), *count);
+                            format!("{}    \u{1b}[2m└\u{1b}[22m {} {}", indent, mark, label)
                         } else {
                             let icon = match collapsed {
                                 true if self.group_has_bell(name) => format!("{} ", BELL_GLYPH),
@@ -4248,7 +4250,11 @@ impl State {
                             let single = self.tab_panes.get(position).filter(|ps| ps.len() == 1);
                             let mark = match single {
                                 Some(ps) if fold.is_none() && self.is_favorite(ps[0].0) => "\u{1b}[33m★\u{1b}[39m ".to_string(),
-                                _ => fold_mark_count(*fold, self.tab_panes.get(position).map_or(0, Vec::len)),
+                                _ => {
+                                    let n = self.tab_panes.get(position).map_or(0, Vec::len);
+                                    let listed = n > 1 || self.show_single_pane;
+                                    fold_mark_count(*fold, if listed { n } else { 0 })
+                                }
                             };
                             format!("{}  {}{}{}", indent, mark, slot, label)
                         }
@@ -4282,7 +4288,9 @@ impl State {
                             let star = if *focused { "\u{1b}[33m★\u{1b}[39m" } else { "\u{1b}[2m★\u{1b}[22m" };
                             // ▸/▾ before the ★, where a tab row has its own, folds the
                             // tab's other panes
-                            format!("  {}{} {}{}", fold_mark(*fav_fold).replace('•', " "), star, icon, title)
+                            let others = self.pane_tab.get(id).and_then(|t| self.tab_panes.get(t)).map_or(0, |ps| ps.len().saturating_sub(1));
+                            let mark = fold_mark_count(*fav_fold, others).replace('•', " ");
+                            format!("  {}{} {}{}", mark, star, icon, title)
                         } else if *flat {
                             let dot = if *focused { "●" } else { " " };
                             format!("  {} {}{}", dot, icon, title)
@@ -4899,7 +4907,8 @@ mod tests {
         assert_eq!(fold_mark_count(Some(false), 3), "▾3");
         assert_eq!(fold_mark_count(Some(true), 12), "▸+");
         // one pane (a fold for its worktrees only): no count
-        assert_eq!(fold_mark_count(Some(true), 1), "▸ ");
+        assert_eq!(fold_mark_count(Some(true), 0), "▸ ");
+        assert_eq!(fold_mark_count(Some(true), 1), "▸1");
         assert_eq!(fold_mark_count(None, 1), fold_mark(None));
     }
 
