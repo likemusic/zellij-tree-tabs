@@ -3033,7 +3033,13 @@ impl State {
             return None;
         }
         let head = self.fav_rows_n.get();
-        let idx = if (r as usize) < head { r as usize } else { r as usize + self.scroll_top };
+        // the line under the sections is their separator, not a row
+        let idx = match r as usize {
+            r if r < head => r,
+            r if r == head && head > 0 => return None,
+            r if head == 0 => r + self.scroll_top,
+            r => r - 1 + self.scroll_top,
+        };
         (idx < len).then_some(idx)
     }
 
@@ -4121,7 +4127,10 @@ impl State {
         };
         // the favorites on top stay put; the window scrolls the rows below them
         let head = self.fav_rows_n.get().min(visible.len());
-        let fit = rows.saturating_sub(TOP_PAD + 1 + footer + head).max(1);
+        // a line between the sections and the tree: scrolled, the tree's first
+        // rows would read as the last favorite's panes
+        let sep = usize::from(head > 0);
+        let fit = rows.saturating_sub(TOP_PAD + 1 + footer + head + sep).max(1);
         let sel = if self.selected >= head { self.selected - head } else { self.scroll_top };
         self.scroll_top = scroll_window(self.scroll_top, sel, visible.len() - head, fit);
         let top = self.scroll_top;
@@ -4134,6 +4143,11 @@ impl State {
         };
         let shown = visible.iter().enumerate().take(head).chain(visible.iter().enumerate().skip(head + top).take(fit));
         for (i, row) in shown {
+            if sep > 0 && i == head + top {
+                let rule = if top > 0 { format!("── ↑{} ", top) } else { String::new() };
+                let rule = format!("{}{}", rule, "─".repeat(cols.saturating_sub(visible_width(&rule))));
+                out.push_str(&format!("\u{1b}[2m{}\u{1b}[0m\r\n", truncate_visible(&rule, cols)));
+            }
             let core = if narrow {
                 match row {
                     Row::Group { name, collapsed: true, .. } if self.group_has_bell(name) => BELL_GLYPH.to_string(),
@@ -4833,6 +4847,14 @@ mod tests {
         assert!(!s.move_favorite(&rows, 1, -1));
         assert!(s.move_favorite(&rows, 1, 1));
         assert_eq!(s.favorites, ["p:3", "m:m1"]);
+
+        // screen lines: the sections, their separator, then the scrolled tree
+        s.fav_rows_n.set(3);
+        s.scroll_top = 2;
+        let at = |s: &State, l: usize| s.row_at((TOP_PAD + l) as isize, 99);
+        assert_eq!((at(&s, 2), at(&s, 3), at(&s, 4)), (Some(2), None, Some(5)));
+        s.fav_rows_n.set(0);
+        assert_eq!(at(&s, 0), Some(2));
     }
 
     #[test]
