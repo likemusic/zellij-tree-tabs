@@ -174,6 +174,11 @@ fn tab_fold_key(label: &str) -> String {
     format!("tab:{}", label)
 }
 
+/// Key in `collapsed` of an unfolded favorite (folded by default).
+fn fav_fold_key(fav: &str) -> String {
+    format!("★{}", fav)
+}
+
 /// ▾/▸ before a tab's label when it has rows of its own (see `Row::Tab`);
 /// a • in the same column for the others, so every tab of a group starts at
 /// one column and the group's shape shows. The small triangles weigh about
@@ -979,7 +984,9 @@ enum Row {
     /// keyboard mode browses onto it (frame highlighted), Enter/click focuses it
     /// `flat`: a session row of the status view — no tree branch, tab-row indent
     /// `fav`: a row of the favorites section on top
-    Pane { id: u32, title: String, depth: usize, focused: bool, last: bool, flat: bool, fav: bool, attention: Option<Attention>, unread: bool },
+    /// `fav_fold`: on a favorite row, whether its tab's other panes are folded
+    /// (None: it has none)
+    Pane { id: u32, title: String, depth: usize, focused: bool, last: bool, flat: bool, fav: bool, fav_fold: Option<bool>, attention: Option<Attention>, unread: bool },
     /// a worktree of a repo shown above with no tab or session in it (local
     /// change); Enter/click opens a tab there
     Worktree { path: String, label: String, depth: usize },
@@ -1220,6 +1227,7 @@ impl State {
                         last: false,
                         flat: true,
                         fav: false,
+                        fav_fold: None,
                         attention,
                     });
                 }
@@ -1328,6 +1336,7 @@ impl State {
                             last: i + 1 == panes.len(),
                             flat: false,
                             fav: false,
+                            fav_fold: None,
                             attention: self.pane_attention.get(id).copied(),
                             unread: self.pane_unread.contains(id),
                         });
@@ -1351,11 +1360,11 @@ impl State {
 
     /// The favorites section (local change): a row per favorite pane — its
     /// title, its tab, and how many other panes of the tab wait for an answer
-    /// or finished unread — and under the favorite in the active tab, the
-    /// other panes of that tab, to jump to the one that asks.
+    /// or finished unread — and under a favorite unfolded by hand (folded by
+    /// default: listing them on every click made the section jump), the other
+    /// panes of that tab, to jump to the one that asks.
     fn favorite_rows<'a>(&self, tabs: impl Iterator<Item = &'a TabItem> + Clone) -> Vec<Row> {
         let mut rows = Vec::new();
-        let mut expanded = false;
         for key in &self.favorites {
             let Some(id) = self.favorite_pane(key) else { continue };
             let Some(pos) = self.pane_tab.get(&id).copied() else { continue };
@@ -1378,6 +1387,7 @@ impl State {
                 label += &format!(" \u{1b}[32m{}{}\u{1b}[39m", self.completed_icon, unread);
             }
             let single = panes.len() == 1;
+            let open = self.collapsed.contains(&fav_fold_key(key));
             rows.push(Row::Pane {
                 id,
                 title: label,
@@ -1386,11 +1396,11 @@ impl State {
                 last: false,
                 flat: true,
                 fav: true,
+                fav_fold: (!others.is_empty()).then_some(!open),
                 attention: self.pane_attention.get(&id).copied().or(if single { it.attention } else { None }),
                 unread: self.pane_unread.contains(&id),
             });
-            if it.active && !expanded {
-                expanded = true;
+            if open {
                 for (i, (oid, otitle, ofocused)) in others.iter().enumerate() {
                     rows.push(Row::Pane {
                         id: *oid,
@@ -1400,6 +1410,7 @@ impl State {
                         last: i + 1 == others.len(),
                         flat: false,
                         fav: false,
+                        fav_fold: None,
                         attention: self.pane_attention.get(oid).copied(),
                         unread: self.pane_unread.contains(oid),
                     });
@@ -2506,6 +2517,11 @@ impl State {
                 self.set_folded(&key, true);
                 return true;
             }
+            Some(Row::Pane { id, fav: true, fav_fold: Some(false), .. }) => {
+                let id = *id;
+                self.fold_favorite(id, true);
+                return true;
+            }
             Some(Row::Group { name, .. }) if name.contains('⎇') => {
                 // a worktree list sits under its tab
                 let Some(i) = rows[..self.selected].iter().rposition(|r| matches!(r, Row::Tab { .. })) else {
@@ -2546,6 +2562,17 @@ impl State {
         self.save_state();
     }
 
+    /// Fold or unfold the other panes under favorite pane `id`.
+    fn fold_favorite(&mut self, id: u32, folded: bool) {
+        let key = fav_fold_key(&self.favorite_key(id));
+        if folded {
+            self.collapsed.remove(&key);
+        } else {
+            self.collapsed.insert(key);
+        }
+        self.save_state();
+    }
+
     /// →: unfold a folded group or tab; on an open one go to its first row.
     fn tree_right(&mut self) -> bool {
         let rows = self.build_rows();
@@ -2558,6 +2585,11 @@ impl State {
             Some(Row::Tab { label, fold: Some(true), .. }) => {
                 let key = tab_fold_key(label);
                 self.set_folded(&key, false);
+                true
+            }
+            Some(Row::Pane { id, fav: true, fav_fold: Some(true), .. }) => {
+                let id = *id;
+                self.fold_favorite(id, false);
                 true
             }
             Some(Row::Group { .. }) | Some(Row::Tab { fold: Some(false), .. }) if self.selected + 1 < rows.len() => {
@@ -2934,6 +2966,13 @@ impl State {
                     if col == mark || col == mark + 1 && self.width_saved.is_none() {
                         let key = tab_fold_key(label);
                         self.set_folded(&key, !folded);
+                    } else {
+                        self.click_row(&rows, idx);
+                    }
+                } else if let Row::Pane { fav: true, fav_fold: Some(folded), id, .. } = &rows[idx] {
+                    // the ▸/▾ before the ★ folds the favorite's other panes
+                    if col <= LEFT_PAD + 1 {
+                        self.fold_favorite(*id, !folded);
                     } else {
                         self.click_row(&rows, idx);
                     }
@@ -4043,7 +4082,7 @@ impl State {
                             format!("{}  {}{}{}", indent, mark, slot, label)
                         }
                     }
-                    Row::Pane { id, title, depth, focused, last, flat, fav, attention, unread } => {
+                    Row::Pane { id, title, depth, focused, last, flat, fav, fav_fold, attention, unread } => {
                         let indent = "  ".repeat(*depth);
                         let branch = if *last { "└" } else { "├" };
                         let icon = match self.pane_exited.get(id) {
@@ -4070,7 +4109,8 @@ impl State {
                         let title = title.as_str();
                         if *fav {
                             let star = if *focused { "\u{1b}[33m★\u{1b}[39m" } else { "\u{1b}[2m★\u{1b}[22m" };
-                            format!("  {} {}{}", star, icon, title)
+                            // ▸/▾ in the margin before the ★ folds the tab's other panes
+                            format!("{}{} {}{}", fold_mark(*fav_fold).replace('•', " "), star, icon, title)
                         } else if *flat {
                             let dot = if *focused { "●" } else { " " };
                             format!("  {} {}{}", dot, icon, title)
@@ -4603,7 +4643,7 @@ mod tests {
     }
 
     #[test]
-    fn favorites_list_on_top_with_the_active_tab_panes_under() {
+    fn favorites_list_on_top_and_unfold_to_their_tabs_panes() {
         assert_eq!(
             zellij_marker("python3 h.py --wrapper w --marker abc -- claude --resume x").as_deref(),
             Some("abc")
@@ -4627,16 +4667,21 @@ mod tests {
             TabItem { position: 0, label: "wsa".into(), active: true, attention: None },
             TabItem { position: 1, label: "rosatom".into(), active: false, attention: None },
         ];
+        let ids = |s: &State| -> Vec<(u32, bool, Option<bool>)> {
+            s.favorite_rows(tabs.iter())
+                .iter()
+                .map(|r| match r {
+                    Row::Pane { id, fav, fav_fold, .. } => (*id, *fav, *fav_fold),
+                    _ => panic!(),
+                })
+                .collect()
+        };
+        // folded by default; rosatom has no other pane to fold
+        assert_eq!(ids(&s), [(1, true, Some(true)), (3, true, None)]);
+        // unfolded: wsa's other pane is under it
+        s.fold_favorite(1, false);
+        assert_eq!(ids(&s), [(1, true, Some(false)), (2, false, None), (3, true, None)]);
         let rows = s.favorite_rows(tabs.iter());
-        let ids: Vec<(u32, bool)> = rows
-            .iter()
-            .map(|r| match r {
-                Row::Pane { id, fav, .. } => (*id, *fav),
-                _ => panic!(),
-            })
-            .collect();
-        // wsa's other pane is under it: the tab is active
-        assert_eq!(ids, [(1, true), (2, false), (3, true)]);
         // the favorite row counts the pane that waits
         assert!(matches!(&rows[0], Row::Pane { title, .. } if title.contains("?1")));
     }
