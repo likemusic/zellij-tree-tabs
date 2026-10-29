@@ -2107,7 +2107,18 @@ impl State {
             return;
         }
         let parent = parent_path(old);
-        let new_path = if parent.is_empty() { new.to_string() } else { format!("{}/{}", parent, new) };
+        // a typed separator gives the whole path (local change): `My:x` moves
+        // the group into My, `:x` to the top level; kept with `/` in the state
+        let new_path = if new.contains(self.separator) {
+            path_segments(new, self.separator).join("/")
+        } else if parent.is_empty() {
+            new.to_string()
+        } else {
+            format!("{}/{}", parent, new)
+        };
+        if new_path.is_empty() || new_path == old {
+            return;
+        }
         let paths = self.tab_group_paths();
         for t in &self.tabs {
             let Some(g) = paths.get(&t.position) else { continue };
@@ -2194,9 +2205,9 @@ impl State {
             BareKey::Right => self.rename_back = (len - at).saturating_sub(1),
             BareKey::Home => self.rename_back = len,
             BareKey::End => self.rename_back = 0,
-            // a separator in a group name would corrupt the state file format;
-            // in a tab's it names the tab's group (see commit_tab_rename)
-            BareKey::Char(c) if plain && !c.is_control() && (c != self.separator || matches!(target, RenameTarget::Tab(_))) => {
+            // a separator gives the whole group path of the tab or group
+            // (commit_tab_rename, commit_rename)
+            BareKey::Char(c) if plain && !c.is_control() => {
                 let b = byte(at);
                 buf.insert(b, c);
             }
