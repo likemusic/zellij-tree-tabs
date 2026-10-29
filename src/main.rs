@@ -81,12 +81,15 @@ const WORKTREES_FILE_PREFIX: &str = "/cache/vtabs-worktrees-";
 /// Last known title of each pane, per session (local change): Zellij clears the
 /// title of a pane whose command exited, and its row went blank.
 const TITLES_FILE_PREFIX: &str = "/cache/vtabs-titles-";
-/// Prints the title of the Claude session behind claude-zellij marker `$1`.
-const SESSION_TITLE_SH: &str = r#"sid=$(cat "$HOME/.local/share/claude-zellij/markers/$1") || exit 1
+/// Prints the title of the Claude session behind claude-zellij marker or session id `$1`.
+/// `$1` is a marker or a session id; -a: a transcript can hold NUL bytes, and
+/// grep then took it for binary and printed nothing.
+const SESSION_TITLE_SH: &str = r#"m="$HOME/.local/share/claude-zellij/markers/$1"
+if [ -f "$m" ]; then sid=$(cat "$m"); else sid=$1; fi
 f=$(ls "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -1)
 [ -n "$f" ] || exit 1
-t=$(grep -o '"customTitle":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4)
-[ -n "$t" ] || t=$(grep -o '"aiTitle":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4)
+t=$(grep -ao '"customTitle":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4)
+[ -n "$t" ] || t=$(grep -ao '"aiTitle":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4)
 printf '%s' "$t""#;
 /// Favorite panes, per session (local change): one key per line, `m:<marker>`
 /// for a claude-zellij pane (survives a restored session), else `p:<pane id>`.
@@ -659,6 +662,9 @@ struct State {
     /// claude-zellij marker of each pane (local change), from its command; kept
     /// once the pane exits — Zellij drops the command of an exited pane
     pane_marker: BTreeMap<u32, String>,
+    /// what names a pane's Claude session (local change): its claude-zellij
+    /// marker, else the id after `--resume` / `--session-id` in its command
+    pane_session: BTreeMap<u32, String>,
     /// rows of the favorites section at the top of the last build_rows
     fav_rows_n: std::cell::Cell<usize>,
     /// per-pane state from the same pipes as the tab markers (local change), kept
@@ -1810,11 +1816,12 @@ impl State {
         let ids: Vec<u32> = self
             .pane_exited
             .keys()
-            .filter(|id| !self.last_titles.contains_key(id) && !self.title_lookups.contains(id))
+            .filter(|id| !self.title_lookups.contains(id))
             .copied()
             .collect();
         for id in ids {
-            let Some(marker) = self.pane_marker.get(&id) else { continue };
+            // the remembered title can be another pane's: ids start over in a restored session
+            let Some(marker) = self.pane_session.get(&id) else { continue };
             self.title_lookups.insert(id);
             let ctx = BTreeMap::from([
                 ("vtabs".to_string(), "session-title".to_string()),
@@ -1856,6 +1863,7 @@ impl State {
         let c = self.pane_unread.remove(&id);
         self.pane_exited.remove(&id);
         self.pane_marker.remove(&id);
+        self.pane_session.remove(&id);
         if self.last_titles.remove(&id).is_some() {
             self.titles_dirty = true;
         }
@@ -3144,6 +3152,9 @@ impl State {
                             if let Some(m) = p.terminal_command.as_deref().and_then(zellij_marker) {
                                 self.pane_marker.insert(p.id, m);
                             }
+                            if let Some(r) = p.terminal_command.as_deref().and_then(session_ref) {
+                                self.pane_session.insert(p.id, r);
+                            }
                             if p.is_focused && !p.is_floating {
                                 focused_terminal.get_or_insert((*tab_pos, p.id));
                             }
@@ -3369,14 +3380,14 @@ impl State {
                 let Some(id) = ctx.get("pane").and_then(|p| p.parse::<u32>().ok()) else { return false };
                 let title = String::from_utf8_lossy(&stdout).trim().to_string();
                 vlog!("session title pane={} exit={:?} title={:?}", id, exit, title);
-                if exit != Some(0) || title.is_empty() || self.last_titles.contains_key(&id) {
+                if exit != Some(0) || title.is_empty() || !self.pane_exited.contains_key(&id) {
                     return false;
                 }
                 self.last_titles.insert(id, title.clone());
                 self.titles_dirty = true;
                 self.save_titles();
                 for panes in self.tab_panes.values_mut() {
-                    for p in panes.iter_mut().filter(|p| p.0 == id && p.1.is_empty()) {
+                    for p in panes.iter_mut().filter(|p| p.0 == id) {
                         p.1 = title.clone();
                     }
                 }
@@ -4054,18 +4065,21 @@ fn tab_name_from_pane(title: &str) -> String {
 /// row's state icon already says it, and `✳` draws as a 2-column emoji.
 /// A pane's title for its row (local change): the short title, remembered while
 /// it is not empty; an exited pane, whose title Zellij clears, gets the last one.
-/// A claude-zellij pane titled with its own command line (held, not started yet)
+/// A Claude pane titled with its own command line (held, not started yet)
 /// counts as untitled too: the name of its session is looked up instead.
 fn pane_title(last: &mut BTreeMap<u32, String>, dirty: &mut bool, id: u32, raw: &str, cmd: Option<&str>, exited: bool) -> String {
-    let raw = if cmd.is_some_and(|c| c == raw && zellij_marker(c).is_some()) {
+    let claude_cmd = cmd.filter(|c| *c == raw && (zellij_marker(c).is_some() || c.split_whitespace().any(|w| w.ends_with("/claude") || w == "claude")));
+    if let Some(c) = claude_cmd {
         if last.get(&id).is_some_and(|l| l == raw) {
             last.remove(&id);
             *dirty = true;
         }
-        ""
-    } else {
-        raw
-    };
+        // `claude --resume` with no id: Enter opens Claude's session picker
+        if session_ref(c).is_none() {
+            return "resume: pick a session".to_string();
+        }
+    }
+    let raw = if claude_cmd.is_some() { "" } else { raw };
     let t = short_title(raw);
     if t.is_empty() {
         return if exited { last.get(&id).cloned().unwrap_or_default() } else { t };
@@ -4088,6 +4102,20 @@ fn zellij_marker(cmd: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// What names the Claude session of a pane command: its claude-zellij marker,
+/// else the session id after `--resume` / `-r` / `--session-id`.
+fn session_ref(cmd: &str) -> Option<String> {
+    zellij_marker(cmd).or_else(|| {
+        let mut words = cmd.split_whitespace();
+        while let Some(w) = words.next() {
+            if matches!(w, "--resume" | "-r" | "--session-id") {
+                return words.next().filter(|id| id.len() == 36 && id.matches('-').count() == 4).map(str::to_string);
+            }
+        }
+        None
+    })
 }
 
 fn strip_claude_glyph(title: &str) -> &str {
@@ -4443,6 +4471,14 @@ mod tests {
         let cmd = "python3 h.py --marker abc -- claude";
         assert_eq!(pane_title(&mut last, &mut dirty, 9, cmd, Some(cmd), true), "");
         assert!(!last.contains_key(&9));
+        // claude run directly: titled by the session id after --resume, looked up
+        let cmd = "node /x/bin/claude --resume 3ee881fb-58e3-4e38-8201-df16da637779 -n ci";
+        assert_eq!(session_ref(cmd).as_deref(), Some("3ee881fb-58e3-4e38-8201-df16da637779"));
+        assert_eq!(pane_title(&mut last, &mut dirty, 11, cmd, Some(cmd), true), "");
+        // with no id there is no session to name: Enter opens the picker
+        let cmd = "node /x/bin/claude --resume";
+        assert_eq!(session_ref(cmd), None);
+        assert_eq!(pane_title(&mut last, &mut dirty, 12, cmd, Some(cmd), true), "resume: pick a session");
         // any other command keeps its command line as the title
         assert_eq!(pane_title(&mut last, &mut dirty, 10, "npm run dev", Some("npm run dev"), true), "npm run dev");
     }
