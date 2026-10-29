@@ -699,6 +699,9 @@ struct State {
     pane_session: BTreeMap<u32, String>,
     /// rows of the favorites section at the top of the last build_rows
     fav_rows_n: std::cell::Cell<usize>,
+    /// the favorite clicked last: the bar follows the focus onto its row, not
+    /// onto the same pane's row in the tree
+    fav_pick: std::cell::Cell<Option<u32>>,
     /// per-pane state from the same pipes as the tab markers (local change), kept
     /// in memory: every instance gets every pipe, so each holds the full map
     pane_attention: BTreeMap<u32, Attention>,
@@ -1620,6 +1623,22 @@ impl State {
     /// Enter on a pane), else the active tab's row.
     fn active_row_index(&self) -> Option<usize> {
         let rows = self.build_rows();
+        // a pane listed twice: the bar stays on the row it was put on (a click on
+        // a favorite used to land it on the tree's row, so Shift+arrows then
+        // moved the tab, not the favorite)
+        if matches!(rows.get(self.selected), Some(Row::Pane { focused: true, .. })) {
+            return Some(self.selected);
+        }
+        if let Some(id) = self.fav_pick.get() {
+            let fav = rows.iter().position(|r| matches!(r, Row::Pane { id: p, fav: true, focused: true, .. } if *p == id));
+            if fav.is_some() {
+                return fav;
+            }
+            // focus went elsewhere: the pick is spent
+            if rows.iter().any(|r| matches!(r, Row::Pane { id: p, focused: true, .. } if *p != id)) {
+                self.fav_pick.set(None);
+            }
+        }
         if self.status_view {
             // focused is set only for the active tab's focused pane there
             return rows.iter().position(|r| matches!(r, Row::Pane { focused: true, .. }));
@@ -3022,6 +3041,10 @@ impl State {
             let _ = std::fs::write(format!("{}{}", PIN_FILE_PREFIX, session), pin);
         }
         self.selected = idx;
+        self.fav_pick.set(match &rows[idx] {
+            Row::Pane { id, fav: true, .. } => Some(*id),
+            _ => None,
+        });
         self.activate(idx);
     }
 
@@ -3667,7 +3690,9 @@ impl State {
             if self.hidden {
                 return false;
             }
-            if !self.keys_on {
+            // a favorite of the focused pane under the bar moves among the favorites
+            let on_fav = matches!(self.build_rows().get(self.selected), Some(Row::Pane { fav: true, focused: true, .. }));
+            if !self.keys_on && !on_fav {
                 match self.build_rows().iter().position(|r| matches!(r, Row::Tab { active: true, .. })) {
                     Some(i) => self.selected = i,
                     None => return false,
