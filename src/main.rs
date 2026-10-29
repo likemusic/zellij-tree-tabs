@@ -4333,7 +4333,8 @@ impl State {
                                 true => self.icon(*attention, *unread),
                                 false => String::new(),
                             };
-                            format!("{}{} {}{} ({})", indent, disc, icon, label, count)
+                            // the count by the ▼/▶, as a tab's by its ▾/▸
+                            format!("{}{}{} {}{}", indent, disc, count, icon, label)
                         }
                     }
                     Row::Tab { position, label, depth, active, attention, unread, fold } => {
