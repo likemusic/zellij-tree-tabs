@@ -3956,13 +3956,13 @@ impl State {
                                 self.state_slot(*attention, *unread, self.tab_background(*position))
                             };
                             let bell = if self.tab_has_bell(*position) { BELL_MARK } else { "" };
-                            // a single-pane tab lists no pane row: its ★ goes on the tab
+                            // a single-pane tab lists no pane row: its ★ takes the • of the tab
                             let single = self.tab_panes.get(position).filter(|ps| ps.len() == 1);
-                            let star = match single {
-                                Some(ps) if self.is_favorite(ps[0].0) => " \u{1b}[33m★\u{1b}[39m",
-                                _ => "",
+                            let mark = match single {
+                                Some(ps) if *fold == None && self.is_favorite(ps[0].0) => "\u{1b}[33m★\u{1b}[39m ",
+                                _ => fold_mark(*fold),
                             };
-                            format!("{}  {}{}{}{}{}", indent, fold_mark(*fold), slot, label, star, bell)
+                            format!("{}  {}{}{}{}", indent, mark, slot, label, bell)
                         }
                     }
                     Row::Pane { id, title, depth, focused, last, flat, fav, attention, unread } => {
@@ -3988,12 +3988,6 @@ impl State {
                             }
                             None => title.to_string(),
                         };
-                        // a favorite listed in the tree: marked, so it isn't added again
-                        let title = if !*fav && self.is_favorite(*id) {
-                            format!("{} \u{1b}[33m★\u{1b}[39m", title)
-                        } else {
-                            title
-                        };
                         let title = title.as_str();
                         if *fav {
                             let star = if *focused { "\u{1b}[33m★\u{1b}[39m" } else { "\u{1b}[2m★\u{1b}[22m" };
@@ -4013,6 +4007,9 @@ impl State {
             let pad = match row {
                 _ if narrow => "",
                 Row::Tab { active: true, .. } => "●",
+                // a favorite listed in the tree: marked on the left, where a long
+                // title can't push it out of the column, so it isn't added again
+                Row::Pane { id, fav: false, .. } if self.is_favorite(*id) => "\u{1b}[33m★\u{1b}[39m",
                 _ => pad.as_str(),
             };
             let line = truncate_visible(&format!("{}{}", pad, core), cols);
