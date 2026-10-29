@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# List otezz/zellij-vtabs and the forks of it and of our repo, with every branch that
+# has commits the upstream main lacks. Branch heads seen last time are kept in
+# ~/.cache/vtabs-forks; a head that moved since then is marked NEW.
+# Usage: vtabs-forks [-a]   (-a: show branches with nothing new too)
+set -u
+all=${1:-}
+upstream=otezz/zellij-vtabs
+ours=likemusic/zellij-tree-tabs
+state=${XDG_CACHE_HOME:-$HOME/.cache}/vtabs-forks
+touch "$state"
+next=$(mktemp)
+trap 'rm -f "$next"' EXIT
+
+{ echo "$upstream"
+  gh api --paginate "repos/$upstream/forks" --jq '.[].full_name'
+  gh api --paginate "repos/$ours/forks" --jq '.[].full_name'; } | sort -u |
+while read -r repo; do
+  [ "$repo" = "$ours" ] && continue
+  gh api --paginate "repos/$repo/branches" --jq '.[]|.name+" "+.commit.sha' |
+  while read -r branch sha; do
+    echo "$repo $branch $sha" >>"$next"
+    ahead=$(gh api "repos/$upstream/compare/main...${repo%%/*}:${repo#*/}:$branch" --jq .ahead_by 2>/dev/null || echo "?")
+    mark=""
+    grep -qx "$repo $branch $sha" "$state" || mark=" NEW"
+    if [ "$ahead" != 0 ] || [ -n "$mark" ] || [ "$all" = -a ]; then
+      echo "$repo:$branch ahead=$ahead ${sha:0:7}$mark  https://github.com/$repo/commits/$branch"
+    fi
+  done
+done
+mv "$next" "$state"
+trap - EXIT
