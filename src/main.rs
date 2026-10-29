@@ -712,10 +712,10 @@ struct State {
     pane_session: BTreeMap<u32, String>,
     /// rows of the favorites section at the top of the last build_rows
     fav_rows_n: std::cell::Cell<usize>,
-    /// the favorite clicked last, and whether its pane has had the focus since:
-    /// the bar follows the focus onto its row, not onto the same pane's row in
-    /// the tree
-    fav_pick: std::cell::Cell<Option<(u32, bool)>>,
+    /// the pane row clicked last (`row_desc`), and whether its pane has had the
+    /// focus since: the bar waits on it for the focus, then stays on that row,
+    /// not the same pane's row elsewhere (a favorite's in the tree)
+    pick: std::cell::RefCell<Option<(String, bool)>>,
     /// diagnostics: the last event or pipe, and the row the last frame had
     /// the bar on — a frame with the bar elsewhere logs `sel` with its cause
     sel_cause: String,
@@ -1647,22 +1647,20 @@ impl State {
         if matches!(rows.get(self.selected), Some(Row::Pane { focused: true, .. })) {
             return Some(self.selected);
         }
-        if let Some((id, reached)) = self.fav_pick.get() {
-            let fav = rows.iter().position(|r| matches!(r, Row::Pane { id: p, fav: true, focused: true, .. } if *p == id));
-            if fav.is_some() {
-                self.fav_pick.set(Some((id, true)));
-                return fav;
+        let pick = self.pick.borrow().clone();
+        if let Some((desc, reached)) = pick {
+            let at = rows.iter().position(|r| matches!(r, Row::Pane { focused: true, .. }) && row_desc(Some(r)) == desc);
+            if at.is_some() {
+                *self.pick.borrow_mut() = Some((desc, true));
+                return at;
             }
-            if !reached {
-                // the focus hasn't moved there yet (a PaneUpdate with the old
-                // focus comes first): the bar waits on the clicked favorite
-                let on_pick = matches!(rows.get(self.selected), Some(Row::Pane { id: p, fav: true, .. }) if *p == id);
-                if on_pick {
-                    return Some(self.selected);
-                }
+            // the focus hasn't moved there yet (a PaneUpdate with the old focus
+            // comes first): the bar waits on the clicked row
+            if !reached && row_desc(rows.get(self.selected)) == desc {
+                return Some(self.selected);
             }
             // focus went elsewhere after: the pick is spent
-            self.fav_pick.set(None);
+            *self.pick.borrow_mut() = None;
         }
         if self.status_view {
             // focused is set only for the active tab's focused pane there
@@ -3085,10 +3083,7 @@ impl State {
             let _ = std::fs::write(format!("{}{}", PIN_FILE_PREFIX, session), pin);
         }
         self.selected = idx;
-        self.fav_pick.set(match &rows[idx] {
-            Row::Pane { id, fav: true, .. } => Some((*id, false)),
-            _ => None,
-        });
+        *self.pick.borrow_mut() = matches!(rows[idx], Row::Pane { .. }).then(|| (row_desc(Some(&rows[idx])), false));
         self.activate(idx);
     }
 
