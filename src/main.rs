@@ -186,8 +186,18 @@ fn fold_mark(fold: Option<bool>) -> &'static str {
     }
 }
 
-/// After a tab (or folded group) label: a pane there rang the bell (local change).
-const BELL_MARK: &str = " \u{1b}[1;33m[!]\u{1b}[22;39m";
+/// In the state column of a row whose pane rang the bell and wasn't looked at
+/// yet (local change): Zellij's `[!]`, which it puts after the pane's title.
+const BELL_GLYPH: &str = "\u{1b}[1;33m!\u{1b}[22;39m";
+
+/// Zellij's bell mark at the end of a pane title (our build passes it to
+/// plugins too): the title without it, and whether it was there.
+fn split_bell(title: &str) -> (&str, bool) {
+    match title.strip_suffix(" [!]") {
+        Some(t) => (t, true),
+        None => (title, false),
+    }
+}
 
 /// The rename buffer with a ▏ cursor `back` characters before its end.
 fn with_cursor(buf: &str, back: usize) -> String {
@@ -651,6 +661,8 @@ struct State {
     tab_panes: BTreeMap<usize, Vec<(u32, String, bool)>>,
     /// panes whose command exited and that Zellij holds (local change), with the exit code
     pane_exited: BTreeMap<u32, Option<i32>>,
+    /// panes with Zellij's pending bell (local change)
+    pane_bell: BTreeSet<u32>,
     /// last non-empty title of each pane (local change), shown for an exited one
     last_titles: BTreeMap<u32, String>,
     titles_dirty: bool,
@@ -1586,7 +1598,12 @@ impl State {
         for panes in self.tab_panes.values_mut() {
             for (id, title, _) in panes.iter_mut() {
                 if let Some(info) = get_pane_info(PaneId::Terminal(*id)) {
-                    let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, *id, &info.title, info.terminal_command.as_deref(), info.exited || info.is_held);
+                    let (raw, bell) = split_bell(&info.title);
+                    let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, *id, raw, info.terminal_command.as_deref(), info.exited || info.is_held);
+                    if bell != self.pane_bell.contains(id) {
+                        if bell { self.pane_bell.insert(*id); } else { self.pane_bell.remove(id); }
+                        changed = true;
+                    }
                     if *title != t {
                         *title = t;
                         changed = true;
@@ -3163,7 +3180,9 @@ impl State {
                     let titled: Vec<_> = list
                         .iter()
                         .map(|p| {
-                            let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, p.id, &p.title, p.terminal_command.as_deref(), p.exited || p.is_held);
+                            let (raw, bell) = split_bell(&p.title);
+                            if bell { self.pane_bell.insert(p.id); } else { self.pane_bell.remove(&p.id); }
+                            let t = pane_title(&mut self.last_titles, &mut self.titles_dirty, p.id, raw, p.terminal_command.as_deref(), p.exited || p.is_held);
                             (p.id, t, p.is_focused)
                         })
                         .collect();
@@ -3644,6 +3663,12 @@ impl State {
     /// the tab was not the active one; cleared when the tab is shown.
     fn tab_has_bell(&self, position: usize) -> bool {
         self.tabs.iter().any(|t| t.position == position && t.has_bell_notification)
+            || self.tab_panes.get(&position).is_some_and(|ps| ps.iter().any(|p| self.pane_bell.contains(&p.0)))
+    }
+
+    /// The state slot with the bell's `!` in place of the state icon.
+    fn bell_slot(&self, bg: (u16, u16)) -> String {
+        format!("{}{} ", BELL_GLYPH, self.background_slot(bg))
     }
 
     fn group_has_bell(&self, group: &str) -> bool {
@@ -3906,10 +3931,13 @@ impl State {
         for (i, row) in shown {
             let core = if narrow {
                 match row {
+                    Row::Group { name, collapsed: true, .. } if self.group_has_bell(name) => BELL_GLYPH.to_string(),
                     Row::Group { collapsed: true, attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
                     Row::Group { collapsed, .. } => (if *collapsed { "▶" } else { "▼" }).to_string(),
+                    Row::Tab { position, .. } if self.tab_has_bell(*position) => BELL_GLYPH.to_string(),
                     Row::Tab { attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
                     Row::Tab { active, .. } => (if *active { "●" } else { "·" }).to_string(),
+                    Row::Pane { id, .. } if self.pane_bell.contains(id) => format!(" {} ", BELL_GLYPH),
                     Row::Pane { id, .. } if self.pane_exited.contains_key(id) => format!(" \u{1b}[2m{}\u{1b}[22m ", self.exited_icon),
                     Row::Pane { attention, unread, .. } => format!(" {}", self.icon_slot(*attention, *unread)),
                     Row::Worktree { .. } => "○".to_string(),
@@ -3933,9 +3961,12 @@ impl State {
                             let indent = "  ".repeat(depth.saturating_sub(3));
                             format!("{}    \u{1b}[2m└\u{1b}[22m {} {} ({})", indent, disc, label, count)
                         } else {
-                            let icon = if *collapsed { self.icon(*attention, *unread) } else { String::new() };
-                            let bell = if *collapsed && self.group_has_bell(name) { BELL_MARK } else { "" };
-                            format!("{}{} {}{} ({}){}", indent, disc, icon, label, count, bell)
+                            let icon = match collapsed {
+                                true if self.group_has_bell(name) => format!("{} ", BELL_GLYPH),
+                                true => self.icon(*attention, *unread),
+                                false => String::new(),
+                            };
+                            format!("{}{} {}{} ({})", indent, disc, icon, label, count)
                         }
                     }
                     Row::Tab { position, label, depth, active, attention, unread, fold } => {
@@ -3950,25 +3981,27 @@ impl State {
                         if let Some(buf) = editing {
                             format!("{}  {}{}", indent, fold_mark(*fold), with_cursor(buf, self.rename_back))
                         } else {
-                            let slot = if self.tab_exited(*position) {
+                            let slot = if self.tab_has_bell(*position) {
+                                self.bell_slot(self.tab_background(*position))
+                            } else if self.tab_exited(*position) {
                                 format!("\u{1b}[2m{}\u{1b}[22m{} ", self.exited_icon, self.background_slot(self.tab_background(*position)))
                             } else {
                                 self.state_slot(*attention, *unread, self.tab_background(*position))
                             };
-                            let bell = if self.tab_has_bell(*position) { BELL_MARK } else { "" };
                             // a single-pane tab lists no pane row: its ★ takes the • of the tab
                             let single = self.tab_panes.get(position).filter(|ps| ps.len() == 1);
                             let mark = match single {
                                 Some(ps) if *fold == None && self.is_favorite(ps[0].0) => "\u{1b}[33m★\u{1b}[39m ",
                                 _ => fold_mark(*fold),
                             };
-                            format!("{}  {}{}{}{}", indent, mark, slot, label, bell)
+                            format!("{}  {}{}{}", indent, mark, slot, label)
                         }
                     }
                     Row::Pane { id, title, depth, focused, last, flat, fav, attention, unread } => {
                         let indent = "  ".repeat(*depth);
                         let branch = if *last { "└" } else { "├" };
                         let icon = match self.pane_exited.get(id) {
+                            _ if self.pane_bell.contains(id) => self.bell_slot(self.background_of([id])),
                             // paused in the state column, where its ✓ was
                             Some(_) => format!("\u{1b}[2m{}\u{1b}[22m{} ", self.exited_icon, self.background_slot(self.background_of([id]))),
                             None => self.state_slot(*attention, *unread, self.background_of([id])),
