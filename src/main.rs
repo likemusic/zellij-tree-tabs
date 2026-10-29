@@ -1823,9 +1823,13 @@ impl State {
     fn refresh_tab_cwds(&mut self) -> bool {
         let mut changed = false;
         for (position, panes) in &self.tab_panes {
-            let cwd = panes.iter().find_map(|(id, _, _)| {
-                get_pane_cwd(PaneId::Terminal(*id)).ok().map(|p| p.to_string_lossy().into_owned())
-            });
+            // the first pane in a project a `dirgroup` rule knows (local change):
+            // a shell left in ~ ahead of it used to put the tab in General
+            let cwds: Vec<String> = panes
+                .iter()
+                .filter_map(|(id, _, _)| get_pane_cwd(PaneId::Terminal(*id)).ok().map(|p| p.to_string_lossy().into_owned()))
+                .collect();
+            let cwd = cwds.iter().find(|c| dir_group_path(&self.dir_groups, c).is_some()).or(cwds.first()).cloned();
             if let Some(cwd) = cwd {
                 if self.tab_cwd.get(position) != Some(&cwd) {
                     vlog!("tab cwd my_id={} tab={} cwd={} group={:?}", self.my_id, position, cwd, dir_group_path(&self.dir_groups, &cwd));
