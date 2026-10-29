@@ -199,12 +199,16 @@ fn split_bell(title: &str) -> (&str, bool) {
     }
 }
 
-/// The rename buffer with a ▏ cursor `back` characters before its end.
+/// The rename buffer with a block cursor `back` characters before its end:
+/// the character under it drawn out of the selection bar's reverse video
+/// (a ▏ between characters took a cell of its own and read as a space).
 fn with_cursor(buf: &str, back: usize) -> String {
     let chars: Vec<char> = buf.chars().collect();
     let at = chars.len() - back.min(chars.len());
-    let (a, b): (String, String) = (chars[..at].iter().collect(), chars[at..].iter().collect());
-    format!("{}▏{}", a, b)
+    let a: String = chars[..at].iter().collect();
+    let under = chars.get(at).copied().unwrap_or(' ');
+    let b: String = chars.iter().skip(at + 1).collect();
+    format!("{}\u{1b}[27m{}\u{1b}[7m{}", a, under, b)
 }
 
 fn basename(path: &str) -> &str {
@@ -4352,9 +4356,9 @@ mod tests {
 
     #[test]
     fn rename_cursor_sits_back_from_the_end() {
-        assert_eq!(with_cursor("абв", 0), "абв▏");
-        assert_eq!(with_cursor("абв", 1), "аб▏в");
-        assert_eq!(with_cursor("абв", 9), "▏абв");
+        assert_eq!(with_cursor("абв", 0), "абв\u{1b}[27m \u{1b}[7m");
+        assert_eq!(with_cursor("абв", 1), "аб\u{1b}[27mв\u{1b}[7m");
+        assert_eq!(with_cursor("абв", 9), "\u{1b}[27mа\u{1b}[7mбв");
     }
 
     #[test]
