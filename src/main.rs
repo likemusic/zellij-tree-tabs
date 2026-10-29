@@ -715,6 +715,10 @@ struct State {
     /// the favorite clicked last: the bar follows the focus onto its row, not
     /// onto the same pane's row in the tree
     fav_pick: std::cell::Cell<Option<u32>>,
+    /// diagnostics: the last event or pipe, and the row the last frame had
+    /// the bar on — a frame with the bar elsewhere logs `sel` with its cause
+    sel_cause: String,
+    sel_seen: String,
     /// per-pane state from the same pipes as the tab markers (local change), kept
     /// in memory: every instance gets every pipe, so each holds the full map
     pane_attention: BTreeMap<u32, Attention>,
@@ -2991,6 +2995,25 @@ impl State {
         self.reselect(keep);
     }
 
+    /// Run an event or pipe keeping the bar on its row (local change): the bar
+    /// is an index, and rows coming or going above it (a session starting to
+    /// wait, a favorite unfolding) moved it onto another row. A handler that
+    /// moved the bar itself is left alone.
+    fn keep_sel<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let (idx, desc) = (self.selected, row_desc(self.build_rows().get(self.selected)));
+        let r = f(self);
+        if self.selected == idx {
+            let rows = self.build_rows();
+            if row_desc(rows.get(idx)) != desc {
+                if let Some(i) = rows.iter().position(|r| row_desc(Some(r)) == desc) {
+                    vlog!("keep-sel {} {} -> {} by={}", desc, idx, i, self.sel_cause);
+                    self.selected = i;
+                }
+            }
+        }
+        r
+    }
+
     /// What the selection is on — (tab position, pane id, group name) — to find
     /// it again after the rows change.
     fn selected_key(&self) -> (Option<usize>, Option<u32>, Option<String>) {
@@ -3237,6 +3260,18 @@ impl State {
     }
 
     fn update_inner(&mut self, event: Event) -> bool {
+        self.sel_cause = match &event {
+            Event::TabUpdate(_) => "TabUpdate",
+            Event::PaneUpdate(_) => "PaneUpdate",
+            Event::Mouse(_) => "Mouse",
+            Event::Key(_) => "Key",
+            Event::Timer(_) => "Timer",
+            Event::Visible(_) => "Visible",
+            Event::RunCommandResult(..) => "RunCommandResult",
+            Event::SessionUpdate(..) => "SessionUpdate",
+            _ => "other",
+        }
+        .to_string();
         match event {
             // Not in load(): a non-selectable pane can't take the `y` answer to the
             // permission prompt, so pin only after the grant (cached grants fire it too).
@@ -3697,6 +3732,7 @@ impl State {
 
     /// Attention signals: `zellij-vtabs::waiting|completed::<pane_id>` (broadcast CLI pipe).
     fn pipe_inner(&mut self, pipe_message: PipeMessage) -> bool {
+        self.sel_cause = format!("pipe {}", pipe_message.name);
         // Alt+i / Alt+o (local change): move a row in the sidebar's own order —
         // the selected one in keyboard mode, else the active tab's row
         if pipe_message.name == "vtabs-move" {
@@ -4068,7 +4104,7 @@ impl State {
             },
             "vtabs-frame" | "vtabs-cmd" => {}
             _ => {
-                self.pipe_inner(msg);
+                self.keep_sel(|s| s.pipe_inner(msg));
                 self.push_frame(self.my_id);
             }
         }
@@ -4144,6 +4180,14 @@ impl State {
     /// The sidebar's text for a pane of `rows` x `cols`.
     fn frame(&mut self, rows: usize, cols: usize) -> String {
         let visible = self.build_rows();
+        let seen = row_desc(visible.get(self.selected));
+        if seen != self.sel_seen {
+            vlog!(
+                "sel {} -> {} idx={} head={} keys_on={} focus={:?} by={}",
+                self.sel_seen, seen, self.selected, self.fav_rows_n.get(), self.keys_on, self.my_focused, self.sel_cause
+            );
+            self.sel_seen = seen;
+        }
         let pad = " ".repeat(LEFT_PAD);
         let mut out = String::new();
         for _ in 0..TOP_PAD {
@@ -4380,7 +4424,7 @@ impl ZellijPlugin for State {
             Role::Brain => {
                 // a resize or a moved selection changes the frame too: it is
                 // compared with the last one sent, not trusted to the return value
-                self.update_inner(event);
+                self.keep_sel(|s| s.update_inner(event));
                 self.push_frame(self.my_id);
                 false
             }
@@ -4517,6 +4561,17 @@ fn strip_claude_glyph(title: &str) -> &str {
 }
 
 /// `s` without ANSI CSI escape sequences (click diagnostics).
+/// A row as the selection log and `keep_sel` know it.
+fn row_desc(row: Option<&Row>) -> String {
+    match row {
+        Some(Row::Pane { id, fav, flat, .. }) => format!("pane {}{}", id, if *fav { " fav" } else if *flat { " flat" } else { "" }),
+        Some(Row::Tab { position, label, .. }) => format!("tab {} {}", position, label),
+        Some(Row::Group { name, .. }) => format!("group {}", name),
+        Some(Row::Worktree { path, .. }) => format!("worktree {}", path),
+        None => "none".to_string(),
+    }
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars();
