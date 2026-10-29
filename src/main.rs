@@ -656,6 +656,8 @@ struct State {
     titles_dirty: bool,
     /// exited panes whose session title was already looked up (local change)
     title_lookups: BTreeSet<u32>,
+    /// CLI pipe ids of `vtabs-rehome` already acted on (local change)
+    rehome_seen: BTreeSet<String>,
     /// favorite panes, in the order they were added (local change): listed on
     /// top of the tree and kept there when the list scrolls
     favorites: Vec<String>,
@@ -2825,6 +2827,20 @@ impl State {
                 None => false,
             },
             Mouse::LeftClick(row, col) => {
+                // diagnostics: what the clicked screen was last sent, and its line under the click
+                if let Some(frame) = self.sent_frames.get(&self.my_id) {
+                    let lines: Vec<String> = frame.split("\r\n").map(strip_ansi).collect();
+                    vlog!(
+                        "click-debug screen={} row={} lines={} size={:?} fav={} at={:?}",
+                        self.my_id,
+                        row,
+                        lines.len(),
+                        self.screen_size.get(&self.my_id),
+                        self.fav_rows_n.get(),
+                        lines.get(row.max(0) as usize)
+                    );
+                    let _ = std::fs::write("/cache/vtabs-click-frame", lines.join("\n"));
+                }
                 let Some(idx) = self.row_at(row, len) else { return false };
                 let rows = self.build_rows();
                 if let Row::Group { name, depth, .. } = &rows[idx] {
@@ -3394,6 +3410,13 @@ impl State {
                 true
             }
             Event::Key(key) => self.handle_key(key),
+            // a brain has no pane on screen, yet Zellij can route a click to
+            // it (relative to the suppressed pane's own place): only the
+            // screens' forwarded clicks are real (local change)
+            Event::Mouse(mouse) if self.role == Role::Brain => {
+                vlog!("brain own mouse ignored self_id={} {:?}", self.self_id, encode_mouse(&mouse));
+                false
+            }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             _ => false,
         }
@@ -3415,6 +3438,42 @@ impl State {
             }
             let delta = if pipe_message.payload.as_deref() == Some("up") { -1 } else { 1 };
             return self.move_selected(delta);
+        }
+        // `zellij pipe -n vtabs-rehome [-- <tab position>]` (local change): move
+        // every terminal pane of the tab (default: the active one) into a new tab
+        // of the same name. Zellij 0.45 can get a tab stuck in a mouse selection
+        // or resize that no click ends (every click in it is then ignored); the
+        // panes keep running, the new tab starts clean.
+        if pipe_message.name == "vtabs-rehome" {
+            if self.role != Role::Brain {
+                return false;
+            }
+            // answer the CLI at once: left waiting, Zellij delivered it again,
+            // and the second one moved the next tab too
+            if let PipeSource::Cli(id) = &pipe_message.source {
+                unblock_cli_pipe_input(id);
+                if !self.rehome_seen.insert(id.clone()) {
+                    return false;
+                }
+            }
+            let pos = match pipe_message.payload.as_deref().map(str::trim) {
+                Some(p) if !p.is_empty() => p.parse().ok(),
+                _ => self.tabs.iter().find(|t| t.active).map(|t| t.position),
+            };
+            let Some(pos) = pos else { return false };
+            let Some(tab) = self.tabs.iter().find(|t| t.position == pos) else { return false };
+            let ids: Vec<PaneId> = self
+                .tab_panes
+                .get(&pos)
+                .into_iter()
+                .flatten()
+                .map(|p| PaneId::Terminal(p.0))
+                .collect();
+            vlog!("rehome tab={} name={:?} panes={:?}", pos, tab.name, ids);
+            if !ids.is_empty() {
+                break_panes_to_new_tab(&ids, Some(tab.name.clone()), true);
+            }
+            return false;
         }
         if pipe_message.name == "vtabs-focus" {
             // Every instance (one per tab) gets the message; only the one whose tab
@@ -3665,6 +3724,9 @@ impl State {
             Event::Key(key) => self.to_brain("vtabs-key", encode_key(&key)),
             Event::Mouse(mouse) => {
                 if let Some(m) = encode_mouse(&mouse) {
+                    if !m.starts_with('U') && !m.starts_with('D') {
+                        vlog!("screen mouse my_id={} {}", self.self_id, m);
+                    }
                     self.to_brain("vtabs-mouse", m);
                 }
             }
@@ -4124,6 +4186,24 @@ fn strip_claude_glyph(title: &str) -> &str {
         Some(c) if c == '✳' || ('\u{2800}'..='\u{28ff}').contains(&c) => chars.as_str().trim_start(),
         _ => title,
     }
+}
+
+/// `s` without ANSI CSI escape sequences (click diagnostics).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Number of *visible* characters, ignoring ANSI CSI escape sequences (`ESC [ … letter`).
