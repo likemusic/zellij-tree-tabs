@@ -600,6 +600,15 @@ fn parse_attention(name: &str) -> (Option<Attention>, &str) {
 /// Status-view group headers, in display order (local change).
 const STATUS_GROUPS: [&str; 4] = ["Waiting", "Working", "Done", "Idle"];
 
+/// Keys (in `collapsed`) and labels of the sections on top of the project
+/// view (local change). A key is never a group path: those come from a tab
+/// name or a directory and hold no '§'.
+const SECTIONS: [(&str, &str); 2] = [("§fav", "Favorites"), ("§wait", "Waiting")];
+
+fn is_section(name: &str) -> bool {
+    name.starts_with('§')
+}
+
 /// Below this width — or when collapsed — the sidebar draws only state icons
 /// (local change).
 const NARROW_COLS: usize = 8;
@@ -1267,7 +1276,7 @@ impl State {
         }
         let mut items: BTreeMap<String, Vec<TabItem>> = self.grouped_items().into_iter().collect();
         let names: Vec<String> = items.keys().cloned().collect();
-        let mut rows = self.favorite_rows(items.values().flatten());
+        let mut rows = self.section_rows(items.values().flatten());
         self.fav_rows_n.set(rows.len());
         // depth of a collapsed group whose subtree is being skipped
         let mut skip_below: Option<usize> = None;
@@ -1353,6 +1362,80 @@ impl State {
                         }
                     }
                 }
+            }
+        }
+        rows
+    }
+
+    /// The sections on top of the tree (local change), each under a header that
+    /// folds it, left out while empty: Favorites first, then Waiting — every
+    /// session that asks for an answer — whose churn so doesn't move the
+    /// favorites.
+    fn section_rows<'a>(&self, tabs: impl Iterator<Item = &'a TabItem> + Clone) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let favs = self.favorite_rows(tabs.clone());
+        let n = favs.iter().filter(|r| matches!(r, Row::Pane { fav: true, .. })).count();
+        self.push_section(&mut rows, SECTIONS[0], favs, n);
+        let waiting = self.waiting_rows(tabs);
+        let n = waiting.len();
+        self.push_section(&mut rows, SECTIONS[1], waiting, n);
+        rows
+    }
+
+    fn push_section(&self, rows: &mut Vec<Row>, (name, label): (&str, &str), items: Vec<Row>, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let collapsed = self.collapsed.contains(name);
+        let attention = items.iter().fold(None, |acc, r| match r {
+            Row::Pane { attention: Some(x), .. } => Some(merge(acc, *x)),
+            _ => acc,
+        });
+        let unread = items.iter().any(|r| matches!(r, Row::Pane { unread: true, .. }));
+        rows.push(Row::Group {
+            name: name.to_string(),
+            label: label.to_string(),
+            depth: 0,
+            collapsed,
+            count,
+            attention,
+            unread,
+        });
+        if !collapsed {
+            rows.extend(items);
+        }
+    }
+
+    /// A row per pane waiting for an answer, in tree order, labelled like the
+    /// status view: its title and its tab (a one-pane tab: the tab's label).
+    fn waiting_rows<'a>(&self, tabs: impl Iterator<Item = &'a TabItem>) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for it in tabs {
+            let Some(panes) = self.tab_panes.get(&it.position) else { continue };
+            for (id, title, focused) in panes {
+                let own = self.pane_attention.get(id).copied();
+                let att = if panes.len() == 1 { own.or(it.attention) } else { own };
+                if att != Some(Attention::Waiting) {
+                    continue;
+                }
+                let name = strip_claude_glyph(title);
+                let title = if panes.len() == 1 || name.is_empty() || name == it.label {
+                    it.label.clone()
+                } else {
+                    format!("{}\u{1b}[2m · {}\u{1b}[22m", name, it.label)
+                };
+                rows.push(Row::Pane {
+                    id: *id,
+                    title,
+                    depth: 0,
+                    focused: *focused && it.active,
+                    last: false,
+                    flat: true,
+                    fav: false,
+                    fav_fold: None,
+                    attention: att,
+                    unread: self.pane_unread.contains(id),
+                });
             }
         }
         rows
@@ -2007,6 +2090,10 @@ impl State {
             return false;
         }
         let rows = self.build_rows();
+        // the sections on top keep their order
+        if self.selected < self.fav_rows_n.get() {
+            return false;
+        }
         // a pane row (where the bar lands after a click on its tab) moves its tab
         if let Some(Row::Pane { id, fav: false, .. }) = rows.get(self.selected) {
             let tab = self.pane_tab.get(id).copied();
@@ -2477,7 +2564,7 @@ impl State {
                 match rows.get(self.selected) {
                     Some(Row::Group { .. }) if self.status_view => false,
                     // the worktree list of a repo: nothing to rename
-                    Some(Row::Group { name, .. }) if name.contains('⎇') => false,
+                    Some(Row::Group { name, .. }) if name.contains('⎇') || is_section(name) => false,
                     Some(Row::Group { name, .. }) => {
                         self.renaming =
                             Some((RenameTarget::Group(name.clone()), leaf_name(name).to_string()));
@@ -2538,7 +2625,8 @@ impl State {
         };
         let up = rows[..self.selected].iter().rposition(|r| match (r, parent_depth) {
             (Row::Group { depth, .. }, Some(d)) => *depth == d,
-            (Row::Tab { .. }, None) => true,
+            // a pane goes to its tab; in a section on top, to the section's header
+            (Row::Tab { .. }, None) | (Row::Group { .. }, None) => true,
             _ => false,
         });
         match up {
@@ -2971,7 +3059,7 @@ impl State {
                     }
                 } else if let Row::Pane { fav: true, fav_fold: Some(folded), id, .. } = &rows[idx] {
                     // the ▸/▾ before the ★ folds the favorite's other panes
-                    if col <= LEFT_PAD + 1 {
+                    if col == LEFT_PAD + 2 || col == LEFT_PAD + 3 {
                         self.fold_favorite(*id, !folded);
                     } else {
                         self.click_row(&rows, idx);
@@ -4109,8 +4197,9 @@ impl State {
                         let title = title.as_str();
                         if *fav {
                             let star = if *focused { "\u{1b}[33m★\u{1b}[39m" } else { "\u{1b}[2m★\u{1b}[22m" };
-                            // ▸/▾ in the margin before the ★ folds the tab's other panes
-                            format!("{}{} {}{}", fold_mark(*fav_fold).replace('•', " "), star, icon, title)
+                            // ▸/▾ before the ★, where a tab row has its own, folds the
+                            // tab's other panes
+                            format!("  {}{} {}{}", fold_mark(*fav_fold).replace('•', " "), star, icon, title)
                         } else if *flat {
                             let dot = if *focused { "●" } else { " " };
                             format!("  {} {}{}", dot, icon, title)
@@ -4684,6 +4773,26 @@ mod tests {
         let rows = s.favorite_rows(tabs.iter());
         // the favorite row counts the pane that waits
         assert!(matches!(&rows[0], Row::Pane { title, .. } if title.contains("?1")));
+
+        // sections: Favorites, then Waiting; a header folds its section
+        let heads = |s: &State| -> Vec<String> {
+            s.section_rows(tabs.iter())
+                .iter()
+                .map(|r| match r {
+                    Row::Group { label, count, .. } => format!("{} {}", label, count),
+                    Row::Pane { id, .. } => id.to_string(),
+                    _ => panic!(),
+                })
+                .collect()
+        };
+        assert_eq!(heads(&s), ["Favorites 2", "1", "2", "3", "Waiting 1", "2"]);
+        s.collapsed.insert(SECTIONS[0].0.to_string());
+        assert_eq!(heads(&s), ["Favorites 2", "Waiting 1", "2"]);
+        // a one-pane tab waits by its tab's mark; nothing waits: no Waiting header
+        let marked = [TabItem { position: 1, label: "rosatom".into(), active: false, attention: Some(Attention::Waiting) }];
+        assert!(matches!(&s.waiting_rows(marked.iter())[..], [Row::Pane { id: 3, .. }]));
+        s.pane_attention.clear();
+        assert_eq!(heads(&s), ["Favorites 2"]);
     }
 
     #[test]
