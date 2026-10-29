@@ -3305,7 +3305,13 @@ impl State {
                 self.my_focused = self.my_tab.and_then(|t| manifest.panes.get(&t)).and_then(|ps| {
                     ps.iter().find(|p| !p.is_plugin && p.is_focused && !p.is_suppressed).map(|p| p.id)
                 });
-                if !self.hidden && was_focused.is_some() && was_focused != self.my_focused {
+                // focus moved to another pane of the same tab: the bar follows it
+                // again. Not a switch to another tab — the clicked tab row stays
+                // selected (the new tab's focused pane differs from the old one's).
+                let same_tab = |a: Option<u32>, b: Option<u32>| {
+                    a.and_then(|a| self.pane_tab.get(&a)).is_some_and(|t| b.and_then(|b| self.pane_tab.get(&b)) == Some(t))
+                };
+                if !self.hidden && was_focused.is_some() && was_focused != self.my_focused && same_tab(was_focused, self.my_focused) {
                     self.pin_tab = None;
                 }
                 let read = self.mark_focused_read();
