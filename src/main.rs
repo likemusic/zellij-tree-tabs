@@ -722,6 +722,9 @@ struct State {
     /// what names a pane's Claude session (local change): its claude-zellij
     /// marker, else the id after `--resume` / `--session-id` in its command
     pane_session: BTreeMap<u32, String>,
+    /// marker of a live pane by what runs in it now (`refresh_markers`); its
+    /// command, which Zellij keeps reporting, no longer counts for it
+    running_marker: BTreeMap<u32, Option<String>>,
     /// pid of the Zellij server (local change), see `SERVER_FILE_PREFIX`
     zellij_pid: u32,
     /// titles and unread marks of the previous server's panes, by its ids, held
@@ -1834,11 +1837,45 @@ impl State {
         }
         self.save_titles();
         changed |= self.refresh_tab_cwds();
+        changed |= self.refresh_markers();
         if self.wt_ticks == 0 {
             self.list_worktrees();
         }
         self.wt_ticks = (self.wt_ticks + 1) % WORKTREE_TICKS;
         self.auto_name_tabs();
+        changed
+    }
+
+    /// The marker of each live pane from what runs in it now (local change).
+    /// Zellij keeps reporting the command a pane started with, also after it
+    /// was dropped to a shell where another Claude session runs (a restored
+    /// session, Esc at its Enter prompt): a favorite of the old session then
+    /// named this pane. True if any changed.
+    fn refresh_markers(&mut self) -> bool {
+        let live: Vec<u32> = self
+            .tab_panes
+            .values()
+            .flatten()
+            .map(|(id, _, _)| *id)
+            .filter(|id| !self.pane_exited.contains_key(id))
+            .collect();
+        let mut changed = false;
+        for id in live {
+            let Ok(cmd) = get_pane_running_command(PaneId::Terminal(id)) else { continue };
+            if cmd.is_empty() {
+                continue;
+            }
+            let m = zellij_marker(&cmd.join(" "));
+            if self.pane_marker.get(&id) != m.as_ref() {
+                vlog!("marker pane={} {:?} -> {:?} running={:?}", id, self.pane_marker.get(&id), m, cmd);
+                match &m {
+                    Some(m) => self.pane_marker.insert(id, m.clone()),
+                    None => self.pane_marker.remove(&id),
+                };
+                changed = true;
+            }
+            self.running_marker.insert(id, m);
+        }
         changed
     }
 
@@ -3652,7 +3689,9 @@ impl State {
                         if !p.is_plugin {
                             self.pane_tab.insert(p.id, *tab_pos);
                             if let Some(m) = p.terminal_command.as_deref().and_then(zellij_marker) {
-                                self.pane_marker.insert(p.id, m);
+                                if !self.running_marker.contains_key(&p.id) {
+                                    self.pane_marker.insert(p.id, m);
+                                }
                             }
                             if let Some(r) = p.terminal_command.as_deref().and_then(session_ref) {
                                 self.pane_session.insert(p.id, r);
