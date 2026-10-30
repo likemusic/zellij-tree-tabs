@@ -99,6 +99,13 @@ const FAVORITES_FILE_PREFIX: &str = "/cache/vtabs-fav-";
 /// whose panes all stopped gives none (Zellij has no process to ask), and fell
 /// into General. Lines `name\tcwd`.
 const CWDS_FILE_PREFIX: &str = "/cache/vtabs-cwds-";
+/// Pid of the Zellij server that ran the session last (local change). Another
+/// pid means a restored session: its panes got new ids, so what is kept by
+/// pane id (titles, unread marks, favorites without a marker) is moved over.
+const SERVER_FILE_PREFIX: &str = "/cache/vtabs-server-";
+/// Where each pane sits (local change): lines `id\ttab\tn`, the n-th pane of
+/// the tab, top to bottom — the same place in the restored session.
+const PANES_FILE_PREFIX: &str = "/cache/vtabs-panes-";
 
 fn parse_groups_file(s: &str) -> Vec<(String, String)> {
     s.lines()
@@ -715,6 +722,13 @@ struct State {
     /// what names a pane's Claude session (local change): its claude-zellij
     /// marker, else the id after `--resume` / `--session-id` in its command
     pane_session: BTreeMap<u32, String>,
+    /// pid of the Zellij server (local change), see `SERVER_FILE_PREFIX`
+    zellij_pid: u32,
+    /// titles and unread marks of the previous server's panes, by its ids, held
+    /// until the restored panes are known (`remap_restored_panes`)
+    restored: Option<(BTreeMap<u32, String>, BTreeSet<u32>)>,
+    /// the `PANES_FILE_PREFIX` snapshot written last
+    panes_snap: String,
     /// rows of the favorites section at the top of the last build_rows
     fav_rows_n: std::cell::Cell<usize>,
     /// the pane row clicked last (`row_desc`), and whether its pane has had the
@@ -1158,6 +1172,7 @@ impl State {
             self.load_titles();
             self.load_favorites();
             self.load_worktrees();
+            self.check_server();
         }
         true
     }
@@ -2089,6 +2104,82 @@ impl State {
                     }
                 }
             }
+        }
+    }
+
+    /// A restored session (another server pid than last time): hold the marks
+    /// kept by pane id until the panes are known — the ids now name other panes.
+    fn check_server(&mut self) {
+        let Some(s) = &self.session else { return };
+        let path = format!("{}{}", SERVER_FILE_PREFIX, s);
+        let pid = self.zellij_pid.to_string();
+        let saved = std::fs::read_to_string(&path).unwrap_or_default();
+        if !saved.is_empty() && saved.trim() != pid {
+            vlog!("server restored pid {} -> {}", saved.trim(), pid);
+            self.restored = Some((std::mem::take(&mut self.last_titles), std::mem::take(&mut self.pane_unread)));
+        }
+        let _ = std::fs::write(&path, &pid);
+    }
+
+    /// Each pane's place: the unmarked name of its tab and its index there.
+    fn pane_slots(&self) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        for t in &self.tabs {
+            let name = parse_attention(&t.name).1;
+            for (n, (id, _, _)) in self.tab_panes.get(&t.position).into_iter().flatten().enumerate() {
+                out.push((*id, format!("{}\t{}", name, n)));
+            }
+        }
+        out
+    }
+
+    /// Once every tab's panes are known: move the held marks of a restored
+    /// session from the old pane ids to the panes now in the same places, then
+    /// keep the places of the panes for the next restore.
+    fn remap_restored_panes(&mut self) {
+        if self.tabs.is_empty() || self.tabs.iter().any(|t| !self.tab_panes.contains_key(&t.position)) {
+            return;
+        }
+        let Some(s) = &self.session else { return };
+        let path = format!("{}{}", PANES_FILE_PREFIX, s);
+        let slots = self.pane_slots();
+        if let Some((titles, unread)) = self.restored.take() {
+            let now: BTreeMap<&str, u32> = slots.iter().map(|(id, k)| (k.as_str(), *id)).collect();
+            let map: BTreeMap<u32, u32> = std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| {
+                    let (id, k) = l.split_once('\t')?;
+                    Some((id.parse().ok()?, *now.get(k)?))
+                })
+                .collect();
+            vlog!("restored panes old -> new {:?}", map);
+            for (old, t) in titles {
+                if let Some(new) = map.get(&old) {
+                    self.last_titles.entry(*new).or_insert(t);
+                }
+            }
+            self.titles_dirty = true;
+            self.pane_unread.extend(unread.iter().filter_map(|old| map.get(old)));
+            self.save_unread();
+            // no snapshot yet (first restore with this code): leave them as they are
+            if !map.is_empty() {
+                self.favorites = self
+                    .favorites
+                    .iter()
+                    .filter_map(|k| match k.strip_prefix("p:").and_then(|id| id.parse::<u32>().ok()) {
+                        Some(old) => map.get(&old).map(|new| format!("p:{}", new)),
+                        None => Some(k.clone()),
+                    })
+                    .collect();
+                self.save_favorites();
+            }
+        }
+        let snap: Vec<String> = slots.iter().map(|(id, k)| format!("{}\t{}", id, k)).collect();
+        let snap = snap.join("\n");
+        if snap != self.panes_snap {
+            let _ = std::fs::write(&path, &snap);
+            self.panes_snap = snap;
         }
     }
 
@@ -3317,7 +3408,9 @@ impl State {
         // the state file's saved view, once loaded, wins over this default
         self.status_view =
             configuration.get("default_view").map(String::as_str) == Some("status");
-        self.my_id = get_plugin_ids().plugin_id;
+        let ids = get_plugin_ids();
+        self.my_id = ids.plugin_id;
+        self.zellij_pid = ids.zellij_pid;
         self.self_id = self.my_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -3590,6 +3683,9 @@ impl State {
                             }
                         }
                     }
+                }
+                if self.role == Role::Brain {
+                    self.remap_restored_panes();
                 }
                 self.save_titles();
                 self.lookup_exited_titles();
