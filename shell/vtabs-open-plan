@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Open a tab per plan item in a running Zellij session, each with Claude in the item's dir.
+
+The plan is a JSON array on stdin (or in the file given), e.g. from task-hub:
+    php ~/Projects/task-hub/bin/github.php --open-plan | vtabs-open-plan
+Item fields: name (tab name), cwd (dir, ~ allowed), prompt (Claude's first prompt, optional).
+Other fields are ignored: the sidebar puts the tab in its group by cwd (vtabs-groups).
+
+An item is skipped when a tab with that name is open (status glyph aside). A project item (name =
+the dir's basename) is also skipped when a live pane already sits in its dir; other items, like
+task-hub's gh-inbox in ~/Projects/task-hub, share a dir with unrelated tabs and go by name only. --dry-run prints what would happen; -s picks the session
+($ZELLIJ_SESSION_NAME, else work).
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+CLAUDE = os.environ.get("VTABS_OPEN_CMD") or os.path.expanduser("~/.local/bin/claude-zellij")
+
+
+def zellij(session, *args):
+    r = subprocess.run(["zellij", "-s", session, "action", *args], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        sys.exit(f"vtabs-open-plan: zellij {' '.join(args)}: {r.stderr.strip() or r.returncode}")
+    return r.stdout
+
+
+def bare_name(name):
+    # the sidebar prefixes a status glyph: "⚙ ci-develop", "✅ custom.by"
+    m = re.match(r"^[^\w\s]+\s+(.*)$", name)
+    return m.group(1) if m else name
+
+
+def norm(path):
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):  # dump-layout gives cwds relative to $HOME
+        path = os.path.join(os.path.expanduser("~"), path)
+    return os.path.normpath(path)
+
+
+def open_state(session):
+    names = {bare_name(t["name"]) for t in json.loads(zellij(session, "list-tabs", "--json"))}
+    cwds = {norm(c) for c in re.findall(r'\bcwd="([^"]+)"', zellij(session, "dump-layout"))}
+    return names, cwds
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("plan", nargs="?", help="plan file (default: stdin)")
+    ap.add_argument("-s", "--session", default=os.environ.get("ZELLIJ_SESSION_NAME") or "work")
+    ap.add_argument("-n", "--dry-run", action="store_true")
+    a = ap.parse_args()
+
+    raw = open(a.plan).read() if a.plan else sys.stdin.read()
+    try:
+        plan = json.loads(raw)
+    except ValueError as e:
+        sys.exit(f"vtabs-open-plan: plan is not JSON: {e}")
+    if not isinstance(plan, list):
+        sys.exit("vtabs-open-plan: plan must be a JSON array")
+
+    names, cwds = open_state(a.session)
+    opened = 0
+    for item in plan:
+        name, cwd, prompt = item.get("name"), item.get("cwd"), item.get("prompt") or ""
+        if not name or not cwd:
+            print(f"skip (no name or cwd): {json.dumps(item, ensure_ascii=False)}")
+            continue
+        cwd = norm(cwd)
+        if name in names:
+            print(f"skip {name}: tab is open")
+            continue
+        if name == os.path.basename(cwd) and cwd in cwds:
+            print(f"skip {name}: a pane is open in {cwd}")
+            continue
+        if not os.path.isdir(cwd):
+            print(f"skip {name}: no dir {cwd}")
+            continue
+        cmd = [CLAUDE, prompt] if prompt else [CLAUDE]
+        if a.dry_run:
+            first = prompt.strip().splitlines()[0] if prompt.strip() else ""
+            print(f"open {name} in {cwd}" + (f": {first[:70]}…" if first else ""))
+        else:
+            zellij(a.session, "new-tab", "--name", name, "--cwd", cwd, "--", *cmd)
+            print(f"opened {name} in {cwd}")
+            opened += 1
+        names.add(name)
+        cwds.add(cwd)
+    if not a.dry_run and opened:
+        print(f"{opened} tab(s) opened in session {a.session}")
+
+
+if __name__ == "__main__":
+    main()

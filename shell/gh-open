@@ -1,0 +1,13 @@
+#!/bin/bash
+# Open a Zellij tab with Claude for each project where it's my move on GitHub (task-hub's plan).
+#   gh-open            use the last snapshot (task-hub's monitor refreshes it every 2 h)
+#   gh-open --scan     scan GitHub first (~15 s)
+#   gh-open -n         show what would open; -s <session> picks the session (see vtabs-open-plan)
+set -euo pipefail
+scan=()
+args=()
+for a in "$@"; do
+  if [ "$a" = --scan ]; then scan=(--scan); else args+=("$a"); fi
+done
+plan=$(php "$HOME/Projects/task-hub/bin/github.php" "${scan[@]}" --open-plan)
+printf '%s' "$plan" | "$(dirname "$(readlink -f "$0")")/vtabs-open-plan" "${args[@]}"
