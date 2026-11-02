@@ -6,8 +6,8 @@ The plan is a JSON array on stdin (or in the file given), e.g. from task-hub:
 Item fields: name (tab name), cwd (dir, ~ allowed), prompt (Claude's first prompt, optional).
 Other fields are ignored: the sidebar puts the tab in its group by cwd (vtabs-groups).
 
-An item is skipped when a tab with that name is open (status glyph aside). A project item (name =
-the dir's basename) is also skipped when a live pane already sits in its dir; other items, like
+An item is skipped when a tab with that name is open (status glyph aside). A project item (the name's
+last ":" part = the dir's basename, e.g. github:tm:pest-plugin-browser) is also skipped when a live pane already sits in its dir; other items, like
 task-hub's gh-inbox in ~/Projects/task-hub, share a dir with unrelated tabs and go by name only. --dry-run prints what would happen; -s picks the session
 ($ZELLIJ_SESSION_NAME, else work).
 """
@@ -73,7 +73,7 @@ def main():
         if name in names:
             print(f"skip {name}: tab is open")
             continue
-        if name == os.path.basename(cwd) and cwd in cwds:
+        if name.rsplit(":", 1)[-1] == os.path.basename(cwd) and cwd in cwds:
             print(f"skip {name}: a pane is open in {cwd}")
             continue
         if not os.path.isdir(cwd):
