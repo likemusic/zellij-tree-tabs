@@ -323,7 +323,9 @@ fn derive_auto_name(
 fn dir_group_path(rules: &[(String, String)], cwd: &str) -> Option<(Vec<String>, usize)> {
     let cwd = cwd.trim_end_matches('/');
     rules.iter().find_map(|(pattern, group)| {
-        if !(cwd == pattern.trim_end_matches("/**") || glob_match::glob_match(pattern, cwd)) {
+        // the dir itself too, also of a pattern (`…/rosatom*/**` takes `…/rosatom`)
+        let dir = pattern.trim_end_matches("/**");
+        if !(cwd == dir || glob_match::glob_match(dir, cwd) || glob_match::glob_match(pattern, cwd)) {
             return None;
         }
         let (named, auto) = match group.strip_suffix('*') {
@@ -1893,8 +1895,28 @@ impl State {
                 .filter_map(|(id, _, _)| get_pane_cwd(PaneId::Terminal(*id)).ok().map(|p| p.to_string_lossy().into_owned()))
                 .collect();
             let name = self.tabs.iter().find(|t| t.position == *position).map(|t| parse_attention(&t.name).1.to_string());
-            // in a project now: remembered; else the remembered one, then any
-            let live = cwds.iter().find(|c| dir_group_path(&self.dir_groups, c).is_some()).cloned();
+            // in a project now: remembered; else the remembered one, then any.
+            // The pane in the narrowest group wins: a tab in the shared develop
+            // checkout and in a rosatom worktree belongs to rosatom
+            let group = |c: &str| dir_group_path(&self.dir_groups, c).map(|(g, _)| g);
+            let mut best: Option<(&String, Vec<String>)> = None;
+            for c in &cwds {
+                if let Some(g) = group(c) {
+                    if best.as_ref().is_none_or(|(_, bg)| g.len() > bg.len()) {
+                        best = Some((c, g));
+                    }
+                }
+            }
+            // a remembered narrower group under it stays: its panes may be stopped
+            let kept = name
+                .as_ref()
+                .and_then(|n| self.cwd_by_name.get(n))
+                .filter(|r| match (&best, group(r)) {
+                    (Some((_, bg)), Some(rg)) => rg.len() > bg.len() && rg.starts_with(bg),
+                    _ => false,
+                })
+                .cloned();
+            let live = kept.or(best.map(|(c, _)| c.clone()));
             if let (Some(c), Some(n)) = (&live, &name) {
                 if self.cwd_by_name.get(n) != Some(c) {
                     self.cwd_by_name.insert(n.clone(), c.clone());
@@ -4980,6 +5002,9 @@ mod tests {
         assert_eq!(g("/h/P/tm/cb"), Some((vec!["tm".to_string(), "cb".to_string()], 0)));
         assert_eq!(g("/h/W/a"), Some((vec!["Work".to_string(), "a".to_string()], 1)));
         assert_eq!(g("/h"), None);
+        let rules = vec![("/h/cb/rosatom*/**".to_string(), "r".to_string()), ("/h/**".to_string(), "*".to_string())];
+        assert_eq!(dir_group_path(&rules, "/h/cb/rosatom"), Some((vec!["r".to_string()], 1)));
+        assert_eq!(dir_group_path(&rules, "/h/cb/rosatom-x/app"), Some((vec!["r".to_string()], 1)));
     }
 
     #[test]
