@@ -10,6 +10,11 @@ An item is skipped when a tab with that name is open (status glyph aside). A pro
 last ":" part = the dir's basename, e.g. github:tm:pest-plugin-browser) is also skipped when a live pane already sits in its dir; other items, like
 task-hub's gh-inbox in ~/Projects/task-hub, share a dir with unrelated tabs and go by name only. --dry-run prints what would happen; -s picks the session
 ($ZELLIJ_SESSION_NAME, else work).
+
+A skipped item's prompt is not lost: it is saved to ~/.local/state/vtabs-open-plan/<session>/<name>.md
+(name's ":" as "__") for delivery to the session already there. --json prints a report instead of
+text: {"opened": [{name, cwd}], "skipped": [{name, cwd, reason, tab, prompt_file}]}, where tab is
+the open tab that matched (by name, or the first with a pane in that cwd).
 """
 import argparse
 import json
@@ -42,9 +47,26 @@ def norm(path):
 
 
 def open_state(session):
+    """Open tab names, and every live pane cwd -> the first tab it is in."""
     names = {bare_name(t["name"]) for t in json.loads(zellij(session, "list-tabs", "--json"))}
-    cwds = {norm(c) for c in re.findall(r'\bcwd="([^"]+)"', zellij(session, "dump-layout"))}
+    cwds, tab = {}, None
+    for line in zellij(session, "dump-layout").splitlines():
+        m = re.match(r'\s*tab name="([^"]*)"', line)
+        if m:
+            tab = bare_name(m.group(1))
+            continue
+        for c in re.findall(r'\bcwd="([^"]+)"', line):
+            cwds.setdefault(norm(c), tab)
     return names, cwds
+
+
+def save_prompt(session, name, prompt):
+    d = os.path.expanduser(f"~/.local/state/vtabs-open-plan/{session}")
+    os.makedirs(d, exist_ok=True)
+    f = os.path.join(d, re.sub(r"[^\w.-]", "_", name.replace(":", "__")) + ".md")
+    with open(f, "w") as fh:
+        fh.write(prompt)
+    return f
 
 
 def main():
@@ -52,6 +74,7 @@ def main():
     ap.add_argument("plan", nargs="?", help="plan file (default: stdin)")
     ap.add_argument("-s", "--session", default=os.environ.get("ZELLIJ_SESSION_NAME") or "work")
     ap.add_argument("-n", "--dry-run", action="store_true")
+    ap.add_argument("--json", action="store_true", help="print a JSON report")
     a = ap.parse_args()
 
     raw = open(a.plan).read() if a.plan else sys.stdin.read()
@@ -63,35 +86,43 @@ def main():
         sys.exit("vtabs-open-plan: plan must be a JSON array")
 
     names, cwds = open_state(a.session)
-    opened = 0
+    report = {"opened": [], "skipped": []}
+    say = (lambda *_: None) if a.json else print
+
+    def skip(name, cwd, reason, tab, prompt):
+        f = save_prompt(a.session, name, prompt) if prompt and tab and not a.dry_run else None
+        report["skipped"].append({"name": name, "cwd": cwd, "reason": reason, "tab": tab, "prompt_file": f})
+        say(f"skip {name}: {reason}" + (f" (prompt saved: {f})" if f else ""))
+
     for item in plan:
         name, cwd, prompt = item.get("name"), item.get("cwd"), item.get("prompt") or ""
         if not name or not cwd:
-            print(f"skip (no name or cwd): {json.dumps(item, ensure_ascii=False)}")
+            skip(name, cwd, "no name or cwd", None, "")
             continue
         cwd = norm(cwd)
         if name in names:
-            print(f"skip {name}: tab is open")
+            skip(name, cwd, "tab is open", name, prompt)
             continue
         if name.rsplit(":", 1)[-1] == os.path.basename(cwd) and cwd in cwds:
-            print(f"skip {name}: a pane is open in {cwd}")
+            skip(name, cwd, f"a pane is open in {cwd}", cwds[cwd], prompt)
             continue
         if not os.path.isdir(cwd):
-            print(f"skip {name}: no dir {cwd}")
+            skip(name, cwd, f"no dir {cwd}", None, "")
             continue
         cmd = [CLAUDE, prompt] if prompt else [CLAUDE]
         if a.dry_run:
             first = prompt.strip().splitlines()[0] if prompt.strip() else ""
-            print(f"open {name} in {cwd}" + (f": {first[:70]}…" if first else ""))
+            say(f"open {name} in {cwd}" + (f": {first[:70]}…" if first else ""))
         else:
             zellij(a.session, "new-tab", "--name", name, "--cwd", cwd, "--", *cmd)
-            print(f"opened {name} in {cwd}")
-            opened += 1
+            say(f"opened {name} in {cwd}")
+        report["opened"].append({"name": name, "cwd": cwd})
         names.add(name)
-        cwds.add(cwd)
-    if not a.dry_run and opened:
-        print(f"{opened} tab(s) opened in session {a.session}")
-
+        cwds.setdefault(cwd, name)
+    if a.json:
+        print(json.dumps(report, ensure_ascii=False, indent=1))
+    elif not a.dry_run and report["opened"]:
+        print(f"{len(report['opened'])} tab(s) opened in session {a.session}")
 
 if __name__ == "__main__":
     main()
