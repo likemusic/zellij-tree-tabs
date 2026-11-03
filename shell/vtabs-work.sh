@@ -13,10 +13,12 @@
 #   SubagentStart    -> vtabs-work.sh subagent-start
 #   SubagentStop     -> vtabs-work.sh subagent-stop
 #   Stop             -> vtabs-work.sh stop
+#   StopFailure      -> vtabs-work.sh fail   (local: the turn died on an API error — usage
+#                       limit, overload, auth — and Stop never comes: needs the user)
 #   Notification     -> vtabs-work.sh notify
 #   SessionEnd       -> vtabs-work.sh end
-#   PostToolUse      -> vtabs-work.sh tool   (relights the spinner once after a Notification
-#                       pause, e.g. an answered permission prompt)
+#   PostToolUse      -> vtabs-work.sh tool   (local: relights the spinner once after a
+#                       Notification pause, e.g. an answered permission prompt)
 #
 # Set VTABS_WORK_DRYRUN=1 to print the computed signal instead of piping it
 # (used by the tests).
@@ -46,6 +48,8 @@ signal=$(
     subagent-stop)   subs=$((subs - 1)); [ "$subs" -lt 0 ] && subs=0
                      [ "$main" = 0 ] && [ "$subs" = 0 ] && skip=1 ;;
     stop)            main=0; paused=0 ;;
+    # nothing runs after an API error, subagents included (same limit)
+    fail)            main=0; subs=0; paused=1 ;;
     # Claude also notifies 60 s after a finished turn ("waiting for your input"):
     # nothing is running then, so it is idle, not a question — keep the check.
     notify)          [ "$main" = 0 ] && [ "$subs" -le 0 ] && exit 0
@@ -64,7 +68,7 @@ signal=$(
   # subagent-stop never completes — the main agent is re-invoked to process the
   # result and its own `stop` finalizes, so the spinner survives the tail too.
   case "$event" in
-    notify) echo waiting ;;
+    notify|fail) echo waiting ;;
     end)    echo clear-working ;;
     stop)   if [ "$subs" -le 0 ]; then echo completed; else echo working; fi ;;
     *)      echo working ;;
@@ -79,6 +83,11 @@ case "$event" in
 esac
 
 [ -n "$signal" ] || exit 0
+
+# Local diagnostics: one line per sent signal (kept to the last 500 lines).
+log="$dir/signals.log"
+printf '%s pane=%s:%s event=%s signal=%s\n' "$(date +%H:%M:%S)" "${ZELLIJ_SESSION_NAME:-}" "$ZELLIJ_PANE_ID" "$event" "$signal" >> "$log" 2>/dev/null
+[ "$(wc -l < "$log" 2>/dev/null || echo 0)" -gt 1000 ] && tail -n 500 "$log" > "$log.tmp" && mv "$log.tmp" "$log"
 
 # Sound is gated on the computed signal, so it fires only for the real main-task
 # events — the completed check and the needs-input notification — and stays
