@@ -2527,6 +2527,20 @@ impl State {
         }
     }
 
+    /// Pasted text goes into the name being edited, at the cursor; line breaks
+    /// and other control chars become spaces (a name is one line). Outside a
+    /// rename a paste does nothing (local change).
+    fn paste_rename(&mut self, text: &str) -> bool {
+        let Some((_, buf)) = self.renaming.as_mut() else {
+            return false;
+        };
+        let clean: String = text.trim().chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let at = buf.chars().count() - self.rename_back.min(buf.chars().count());
+        let b = buf.char_indices().nth(at).map_or(buf.len(), |(b, _)| b);
+        buf.insert_str(b, &clean);
+        true
+    }
+
     fn handle_rename_key(&mut self, key: KeyWithModifier) -> bool {
         let Some((target, mut buf)) = self.renaming.take() else {
             return false;
@@ -3486,6 +3500,7 @@ impl State {
             EventType::PaneUpdate,
             EventType::Key,
             EventType::Mouse,
+            EventType::PastedText,
             EventType::Timer,
             EventType::PermissionRequestResult,
             EventType::SessionUpdate,
@@ -3968,6 +3983,7 @@ impl State {
                 true
             }
             Event::Key(key) => self.handle_key(key),
+            Event::PastedText(text) => self.paste_rename(&text),
             // a brain has no pane on screen, yet Zellij can route a click to
             // it (relative to the suppressed pane's own place): only the
             // screens' forwarded clicks are real (local change)
@@ -4289,6 +4305,8 @@ impl State {
     fn screen_update(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) => self.to_brain("vtabs-key", encode_key(&key)),
+            // Shift+Insert / right click: Zellij gives a plugin the text, not keys (local change)
+            Event::PastedText(text) => self.to_brain("vtabs-paste", text),
             Event::Mouse(mouse) => {
                 if let Some(m) = encode_mouse(&mouse) {
                     if !m.starts_with('U') && !m.starts_with('D') {
@@ -4333,6 +4351,11 @@ impl State {
                 if let Some(key) = decode_key(&payload) {
                     self.handle_key(key);
                 }
+                self.push_frame(self.my_id);
+            }
+            "vtabs-paste" => {
+                vlog!("paste from={:?} len={}", from, payload.chars().count());
+                self.paste_rename(&payload);
                 self.push_frame(self.my_id);
             }
             "vtabs-mouse" => {
@@ -4934,6 +4957,16 @@ mod tests {
         assert_eq!(with_cursor("абв", 0), "абв\u{1b}[27m \u{1b}[7m");
         assert_eq!(with_cursor("абв", 1), "аб\u{1b}[27mв\u{1b}[7m");
         assert_eq!(with_cursor("абв", 9), "\u{1b}[27mа\u{1b}[7mбв");
+    }
+
+    #[test]
+    fn paste_goes_in_at_the_cursor_on_one_line() {
+        let mut s = State::default();
+        assert!(!s.paste_rename("x"), "no rename, no paste");
+        s.renaming = Some((RenameTarget::Tab(3), "ab".to_string()));
+        s.rename_back = 1;
+        assert!(s.paste_rename("  github:\nвкладка\t "));
+        assert_eq!(s.renaming.as_ref().unwrap().1, "agithub: вкладкаb");
     }
 
     #[test]
