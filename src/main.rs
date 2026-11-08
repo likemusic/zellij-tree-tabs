@@ -386,6 +386,31 @@ fn fold_paths(raw: &[(Vec<String>, usize)]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// The selected row's text for reverse video (local change): no dim (it reads
+/// as shaded letters there) and no foreground colours — reversed, a coloured
+/// icon turns into a coloured block, a hole in the bar.
+fn plain_bar(bar: &str) -> String {
+    let mut out = String::with_capacity(bar.len());
+    let mut rest = bar;
+    while let Some(i) = rest.find("\u{1b}[") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 2..];
+        let end = tail.find(|c: char| !(c.is_ascii_digit() || c == ';')).unwrap_or(tail.len());
+        let (params, after) = tail.split_at(end);
+        let drop = after.starts_with('m')
+            && matches!(params.split(';').next().unwrap_or(""), "2" | "22" | "38" | "39")
+            || after.starts_with('m') && params.parse::<u8>().is_ok_and(|n| (30..=37).contains(&n) || (90..=97).contains(&n));
+        if drop {
+            rest = &after[1..];
+        } else {
+            out.push_str(&rest[i..i + 2 + end]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn parent_path(path: &str) -> &str {
     path.rfind('/').map_or("", |i| &path[..i])
 }
@@ -4639,9 +4664,7 @@ impl State {
                 } else {
                     line
                 };
-                // no dim inside the bar: dim on reverse video reads as shaded letters
-                let bar = bar.replace("\u{1b}[2m", "").replace("\u{1b}[22m", "");
-                out.push_str(&format!("\u{1b}[7m{}\u{1b}[0m", bar));
+                out.push_str(&format!("\u{1b}[7m{}\u{1b}[0m", plain_bar(&bar)));
             } else if matches!(row, Row::Pane { id, .. } if Some(*id) == twin) {
                 let w = visible_width(&line);
                 let bar = format!("{}{}", line, " ".repeat(cols.saturating_sub(w)));
@@ -4967,6 +4990,12 @@ mod tests {
         s.rename_back = 1;
         assert!(s.paste_rename("  github:\nвкладка\t "));
         assert_eq!(s.renaming.as_ref().unwrap().1, "agithub: вкладкаb");
+    }
+
+    #[test]
+    fn selected_bar_drops_dim_and_icon_colours() {
+        let bar = "\u{1b}[2m└\u{1b}[22m \u{1b}[36m⠿\u{1b}[39m\u{1b}[38;5;208mx\u{1b}[39m \u{1b}[1mname\u{1b}[22m";
+        assert_eq!(plain_bar(bar), "└ ⠿x \u{1b}[1mname");
     }
 
     #[test]
