@@ -1700,6 +1700,13 @@ impl State {
         // a favorite used to land it on the tree's row, so Shift+arrows then
         // moved the tab, not the favorite)
         if matches!(rows.get(self.selected), Some(Row::Pane { focused: true, .. })) {
+            // the clicked row got the focus: the pick is reached. Left unmarked, it
+            // held the bar on that row after the focus moved on (local change)
+            let here = row_desc(rows.get(self.selected));
+            let mut pick = self.pick.borrow_mut();
+            if pick.as_ref().is_some_and(|(desc, _)| *desc == here) {
+                *pick = Some((here, true));
+            }
             return Some(self.selected);
         }
         let pick = self.pick.borrow().clone();
@@ -3873,6 +3880,17 @@ impl State {
                 // hidden: rows are rebuilt when shown (Visible), not on every update
                 if self.hidden && !self.keys_on {
                     return false;
+                }
+                // A click on a pane of another tab waits for the focus to get there
+                // (pending_pane); only keyboard mode cleared it, so after a mouse
+                // click the bar stopped following the focus for good (local change).
+                if !self.keys_on
+                    && self.pending_pane.is_some_and(|p| self.my_focused == Some(p) || !self.pane_tab.contains_key(&p))
+                {
+                    self.pending_pane = None;
+                }
+                if was_focused != self.my_focused {
+                    vlog!("focus {:?} -> {:?} keys_on={} pending={:?} pin={:?} selected={}", was_focused, self.my_focused, self.keys_on, self.pending_pane, self.pin_tab, self.selected);
                 }
                 // only when the focus moved: PaneUpdates also come for a title
                 // or a new pane, and pulled the bar back from where the wheel took it
