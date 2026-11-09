@@ -1,30 +1,55 @@
 #!/bin/bash
 # Install the freshly built plugin into a running session and reload it: the
 # per-tab sidebars (screens), then the brain (through a screen); then re-send every pane's Claude
-# state, which a reloaded brain has lost (marked read: not news).
+# state, which a reloaded brain has lost, keeping the previous unread marks.
 set -u
 s=${1:-work}
+mode=${2:-all}
+case "$mode" in all|--brain-only) ;; *) echo 'Usage: vtabs-reload [session] [--brain-only]' >&2; exit 2;; esac
 src=$(dirname "$0")/../target/wasm32-wasip1/release/zellij-vtabs.wasm
 url="file:$HOME/.config/zellij/plugins/zellij-vtabs.wasm"
-cp "$src" "$HOME/.config/zellij/plugins/" || exit 1
-timeout 30 zellij -s "$s" action start-or-reload-plugin "$url"
-sleep 2
-# the brain runs in the background: start-or-reload-plugin misses it, a screen reloads it by id
-# right after their reload the screens may not know yet which one is visible: retry until the log shows it
+# Снимок непрочитанных меток берём до reload, иначе восстановление их очистит.
+unread_file="$HOME/.cache/zellij/$url/plugin_cache/vtabs-unread-$s"
+unread=""
+if [ -r "$unread_file" ]; then
+  unread=$(tr '\n' ' ' < "$unread_file") || unread=""
+fi
+target="$HOME/.config/zellij/plugins/zellij-vtabs.wasm"
+# При частичном обновлении достаточно повторить запрос brain: панели уже готовы.
 log=/tmp/zellij-$(id -u)/zellij-log/zellij.log
 n=$(grep -c "VTABS reload brain" "$log" 2>/dev/null)
-for _ in 1 2 3 4 5 6; do
-  timeout 30 zellij -s "$s" pipe --plugin "$url" --name vtabs-reload-brain </dev/null
+if [ "$mode" = all ]; then
+  if [ -f "$target" ]; then
+    backup="$target.bak-$(date +%Y%m%d-%H%M%S-%N)"
+    cp -p "$target" "$backup" || exit 1
+    printf 'Backup: %s\n' "$backup"
+  fi
+  cp "$src" "$target" || exit 1
+  timeout 30 zellij -s "$s" action start-or-reload-plugin "$url" || exit 1
+fi
+# Десятки панелей загружаются асинхронно: ждём подтверждения, а не фиксированные 12 с.
+confirmed=false
+for ((attempt=1; attempt<=45; attempt++)); do
+  timeout 5 zellij -s "$s" pipe --plugin "$url" --name vtabs-reload-brain </dev/null || true
   sleep 2
-  [ "$(grep -c "VTABS reload brain" "$log" 2>/dev/null)" != "$n" ] && break
+  if [ "$(grep -c "VTABS reload brain" "$log" 2>/dev/null)" != "$n" ]; then
+    confirmed=true
+    break
+  fi
 done
-# the brain keeps the old code otherwise, and only the screens look new
-[ "$(grep -c "VTABS reload brain" "$log" 2>/dev/null)" = "$n" ] && echo "vtabs-reload: brain NOT reloaded, run again" >&2
+if [ "$confirmed" != true ]; then
+  echo 'vtabs-reload: brain NOT reloaded; повторить с --brain-only' >&2
+  exit 1
+fi
+printf '%s\n' 'vtabs-reload: запрос перезагрузки brain подтверждён'
 sleep 3
 for f in /run/user/$(id -u)/zellij-vtabs/pane-$s-*; do
   id=${f##*-}; case $id in *[!0-9]*) continue;; esac
   read main subs paused < "$f" || true
   if [ "${paused:-0}" = 1 ]; then sig=waiting; elif [ "${main:-0}" = 1 ] || [ "${subs:-0}" -gt 0 ]; then sig=working; else sig=completed; fi
   timeout 5 zellij -s "$s" pipe --name "zellij-vtabs::$sig::$id" </dev/null
-  timeout 5 zellij -s "$s" pipe --name "zellij-vtabs::read::$id" </dev/null
+  case " $unread " in
+    *" $id "*) ;; # прежнюю непрочитанную метку сохраняем
+    *) timeout 5 zellij -s "$s" pipe --name "zellij-vtabs::read::$id" </dev/null ;;
+  esac
 done

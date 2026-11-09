@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use zellij_tile::prelude::*;
 
-/// Blank lines above the tree / spaces to the left of each row (breathing room).
+/// Minimum height of the pinned status summary / spaces left of tree rows.
 const TOP_PAD: usize = 1;
 const LEFT_PAD: usize = 1;
 
@@ -1766,6 +1766,87 @@ impl State {
         if att.is_some() { self.icon(att, unread) } else { "  ".to_string() }
     }
 
+    /// Сводка по вкладкам, не по строкам дерева: избранное и свёрнутые группы
+    /// не меняют числа. Работающая панель важнее ожидающей; неизвестная — готовой.
+    fn status_counts(&self) -> [usize; 7] {
+        // working, waiting, completed, unknown, exited, shell commands, monitors
+        let mut counts = [0; 7];
+        for tab in &self.tabs {
+            let panes = self.tab_panes.get(&tab.position);
+            let tab_mark = parse_attention(&tab.name).0;
+            let mut working = false;
+            let mut waiting = false;
+            let mut completed = false;
+            let mut unknown = false;
+            let mut live = false;
+            for (id, _, _) in panes.into_iter().flatten() {
+                if self.pane_exited.contains_key(id) {
+                    continue;
+                }
+                live = true;
+                let bg = self.pane_background.get(id).copied().unwrap_or((0, 0));
+                counts[5] += usize::from(bg.0);
+                counts[6] += usize::from(bg.1);
+                // Маркер вкладки описывает единственную панель, но не остальные.
+                let mark = self.pane_attention.get(id).copied()
+                    .or_else(|| (panes.is_some_and(|ps| ps.len() == 1)).then_some(tab_mark).flatten());
+                match mark {
+                    Some(Attention::Working) => working = true,
+                    Some(Attention::Waiting) => waiting = true,
+                    Some(Attention::Completed) => completed = true,
+                    None => unknown = true,
+                }
+            }
+            let bucket = if working { 0 } else if waiting { 1 }
+                else if unknown { 3 } else if completed { 2 }
+                else if !live && panes.is_some_and(|ps| !ps.is_empty()) { 4 }
+                else { 3 };
+            counts[bucket] += 1;
+        }
+        counts
+    }
+
+    /// Только иконки и числа. При узкой колонке переносим целые счётчики,
+    /// а не обрезаем фоновые команды справа. Нули остаются видны.
+    fn summary_lines(&self, cols: usize) -> Vec<String> {
+        // В режиме одних значков нет места для числа: оставляем прежний отступ.
+        if cols > 0 && cols < NARROW_COLS {
+            return vec![String::new()];
+        }
+        let counts = self.status_counts();
+        let working = self.spinner.get(self.spin % self.spinner.len().max(1))
+            .map(String::as_str).unwrap_or("⣾");
+        let entries = [
+            (working, 36), (self.waiting_icon.as_str(), 33),
+            (self.completed_icon.as_str(), 32), ("?", 37),
+            (self.exited_icon.as_str(), 90), (self.shell_icon.as_str(), 35),
+            (self.monitor_icon.as_str(), 34),
+        ];
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        let mut width = 0;
+        for ((icon, color), count) in entries.into_iter().zip(counts) {
+            let entry = format!("{}{}", icon, count);
+            let w = visible_width(&entry);
+            if cols > 0 && w > cols {
+                return vec![String::new()];
+            }
+            if !line.is_empty() && cols > 0 && width + 1 + w > cols {
+                lines.push(line);
+                line = String::new();
+                width = 0;
+            }
+            if !line.is_empty() {
+                line.push(' ');
+                width += 1;
+            }
+            line.push_str(&format!("\u{1b}[{}m{}\u{1b}[0m", color, entry));
+            width += w;
+        }
+        lines.push(line);
+        lines
+    }
+
     /// Background work of panes (local change): shells and monitors summed.
     fn background_of<'a>(&self, panes: impl IntoIterator<Item = &'a u32>) -> (u16, u16) {
         panes.into_iter().fold((0, 0), |(s, m), id| {
@@ -3365,20 +3446,41 @@ impl State {
         self.activate(idx);
     }
 
-    /// Index of the row drawn on screen line `row`: the favorites stay on top,
-    /// the rest is the scrolled window (see frame).
+    /// Общая геометрия отрисовки и hit-test: если закреплённые секции не
+    /// помещаются вместе с деревом, прокручиваем весь список, не выталкивая шапку.
+    fn list_layout(&self, rows: usize, cols: usize, len: usize) -> (usize, usize, usize) {
+        let header = self.summary_lines(cols).len().max(TOP_PAD);
+        let narrow = self.width_saved.is_some() && self.role != Role::Brain || cols < NARROW_COLS;
+        let footer = match (&self.moving, self.key_hints()) {
+            (Some(_), _) => self.sessions.len().min(9) + 3,
+            (None, Some(h)) if !narrow => h.len() + 1,
+            _ => 0,
+        };
+        // Последняя строка остаётся запасом от прокрутки терминала после CRLF.
+        let body = rows.saturating_sub(header + 1);
+        let footer = footer.min(body.saturating_sub(1));
+        let available = body - footer;
+        let wanted = self.fav_rows_n.get().min(len);
+        let head = if wanted + usize::from(wanted > 0) < available { wanted } else { 0 };
+        let sep = usize::from(head > 0);
+        (head, sep, available.saturating_sub(head + sep))
+    }
+
+    /// Index of the row drawn on screen line `row`; header/footer/separator
+    /// are not rows, including when counters wrap onto several lines.
     fn row_at(&self, row: isize, len: usize) -> Option<usize> {
-        let r = row - TOP_PAD as isize;
+        let r = row - self.summary_lines(self.my_cols).len().max(TOP_PAD) as isize;
         if r < 0 {
             return None;
         }
-        let head = self.fav_rows_n.get();
-        // the line under the sections is their separator, not a row
-        let idx = match r as usize {
-            r if r < head => r,
-            r if r == head && head > 0 => return None,
-            r if head == 0 => r + self.scroll_top,
-            r => r - 1 + self.scroll_top,
+        let (head, sep, fit) = self.list_layout(self.my_rows, self.my_cols, len);
+        let r = r as usize;
+        let idx = if r < head {
+            r
+        } else if r < head + sep || r >= head + sep + fit {
+            return None;
+        } else {
+            r - sep + self.scroll_top
         };
         (idx < len).then_some(idx)
     }
@@ -4497,6 +4599,11 @@ impl State {
 
     /// The sidebar's text for a pane of `rows` x `cols`.
     fn frame(&mut self, rows: usize, cols: usize) -> String {
+        if rows == 0 || cols == 0 {
+            return String::new();
+        }
+        let summary = self.summary_lines(cols);
+        let header = summary.len();
         let visible = self.build_rows();
         let seen = row_desc(visible.get(self.selected));
         if seen != self.sel_seen {
@@ -4508,8 +4615,15 @@ impl State {
         }
         let pad = " ".repeat(LEFT_PAD);
         let mut out = String::new();
-        for _ in 0..TOP_PAD {
-            out.push_str("\r\n");
+        for (i, line) in summary.iter().take(rows).enumerate() {
+            out.push_str(&truncate_visible(line, cols));
+            out.push_str("\u{1b}[0m");
+            if i + 1 < rows {
+                out.push_str("\r\n");
+            }
+        }
+        if rows <= header {
+            return out;
         }
         if visible.is_empty() {
             out.push_str(&format!("{}\u{1b}[2m(no tabs)\u{1b}[0m", pad));
@@ -4520,19 +4634,10 @@ impl State {
         let narrow = self.width_saved.is_some() && self.role != Role::Brain || cols < NARROW_COLS;
         // a list taller than the pane would scroll the pane's terminal and shift
         // every click by the overflow: draw only the window around the selection
-        let footer = match (&self.moving, self.key_hints()) {
-            (Some(_), _) => self.sessions.len().min(9) + 3,
-            (None, Some(h)) if !narrow => h.len() + 1,
-            _ => 0,
-        };
-        // the favorites on top stay put; the window scrolls the rows below them
-        let head = self.fav_rows_n.get().min(visible.len());
-        // a line between the sections and the tree: scrolled, the tree's first
-        // rows would read as the last favorite's panes
-        let sep = usize::from(head > 0);
-        let fit = rows.saturating_sub(TOP_PAD + 1 + footer + head + sep).max(1);
+        // Сводка закреплена всегда; секции избранного — только пока хватает места.
+        let (head, sep, fit) = self.list_layout(rows, cols, visible.len());
         let sel = if self.selected >= head { self.selected - head } else { self.scroll_top };
-        self.scroll_top = scroll_window(self.scroll_top, sel, visible.len() - head, fit);
+        self.scroll_top = scroll_window(self.scroll_top, sel, visible.len() - head, fit.max(1));
         let top = self.scroll_top;
         // the same pane listed twice (a favorite and its row in the tree): the
         // other row gets a soft bar, so a click on one doesn't read as the
@@ -4724,7 +4829,8 @@ impl State {
                 }
             }
         }
-        out
+        // Меню и подсказки тоже не должны прокручивать терминал при малой высоте.
+        out.split("\r\n").take(rows).collect::<Vec<_>>().join("\r\n")
     }
 }
 
@@ -5285,6 +5391,8 @@ mod tests {
         assert_eq!(s.favorites, ["p:3", "m:m1"]);
 
         // screen lines: the sections, their separator, then the scrolled tree
+        s.my_rows = 99;
+        s.my_cols = 80;
         s.fav_rows_n.set(3);
         s.scroll_top = 2;
         let at = |s: &State, l: usize| s.row_at((TOP_PAD + l) as isize, 99);
@@ -5454,6 +5562,110 @@ mod tests {
         assert!(s.set_pane_background(2, "0 0"));
         assert_eq!(s.tab_background(0), (0, 0));
         assert_eq!(s.state_slot(None, false, (0, 0)), "    ");
+    }
+
+    fn summary_fixture() -> State {
+        let tab = |position: usize, name: &str| TabInfo {
+            position, name: name.into(), ..Default::default()
+        };
+        let panes = |ids: &[u32]| ids.iter().map(|id| (*id, format!("pane{}", id), false)).collect();
+        State {
+            separator: ':', waiting_icon: "◆".into(), completed_icon: "✓".into(),
+            exited_icon: "⊘".into(), shell_icon: "$".into(), monitor_icon: "◉".into(),
+            spinner: vec!["W".into()], my_cols: 80, my_rows: 9,
+            tabs: vec![tab(0, "mixed"), tab(1, "✅ done"), tab(2, "unknown"),
+                tab(3, "exited"), tab(4, "waiting"), tab(5, "partial"), tab(6, "starting")],
+            tab_panes: [(0, panes(&[1, 2])), (1, panes(&[3])), (2, panes(&[4])),
+                (3, panes(&[5])), (4, panes(&[6])), (5, panes(&[7, 8]))].into(),
+            pane_attention: [(1, Attention::Waiting), (2, Attention::Working),
+                (5, Attention::Working), (6, Attention::Waiting), (7, Attention::Completed)].into(),
+            pane_exited: [(5, Some(0))].into(),
+            pane_background: [(2, (2, 1)), (3, (1, 2)), (5, (9, 9)), (999, (9, 9))].into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn summary_counts_tabs_once_with_working_before_waiting() {
+        let mut s = summary_fixture();
+        assert_eq!(s.status_counts(), [1, 1, 1, 3, 1, 3, 3]);
+        // Ни избранное, ни свёрнутые группы, ни смена представления не дублируют вкладки.
+        s.favorites = vec!["p:2".into()];
+        s.collapsed = ["General".into(), "§fav".into()].into();
+        s.status_view = true;
+        assert_eq!(s.status_counts(), [1, 1, 1, 3, 1, 3, 3]);
+        // Завершившаяся панель со старой меткой Working не блокирует готовую.
+        s.tab_panes.get_mut(&1).unwrap().push((5, "exited".into(), false));
+        s.pane_attention.insert(3, Attention::Completed);
+        assert_eq!(s.status_counts(), [1, 1, 1, 3, 1, 3, 3]);
+    }
+
+    #[test]
+    fn summary_keeps_zeroes_and_wraps_whole_counters() {
+        let mut s = summary_fixture();
+        assert_eq!(strip_ansi(&s.summary_lines(80).join(" ")), "W1 ◆1 ✓1 ?3 ⊘1 $3 ◉3");
+        s.tabs.clear();
+        assert_eq!(strip_ansi(&s.summary_lines(80).join(" ")), "W0 ◆0 ✓0 ?0 ⊘0 $0 ◉0");
+        for cols in [8, 15, 28] {
+            let lines = s.summary_lines(cols);
+            assert!(lines.iter().all(|l| visible_width(l) <= cols));
+            assert_eq!(strip_ansi(&lines.join(" ")), "W0 ◆0 ✓0 ?0 ⊘0 $0 ◉0");
+        }
+    }
+
+    #[test]
+    fn summary_small_viewports_do_not_overflow_or_show_ellipsis() {
+        let mut s = summary_fixture();
+        for cols in [1, 2, 4, 7] {
+            assert_eq!(s.summary_lines(cols), vec![String::new()]);
+        }
+        for cols in [1, 2, 8, 15, 28, 80] {
+            s.my_cols = cols;
+            for rows in 1..20 {
+                s.my_rows = rows;
+                for keys in [false, true] {
+                    s.keys_on = keys;
+                    let frame = s.frame(rows, cols);
+                    let lines: Vec<_> = frame.split("\r\n").collect();
+                    assert!(lines.len() <= rows, "{}x{}: {} lines", rows, cols, lines.len());
+                    assert!(lines.iter().all(|l| visible_width(l) <= cols));
+                    for r in 0..rows {
+                        if let Some(idx) = s.row_at(r as isize, s.build_rows().len()) {
+                            assert!(r >= s.summary_lines(cols).len());
+                            assert!(idx < s.build_rows().len());
+                        }
+                    }
+                    assert_eq!(s.row_at(rows as isize, 999), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn summary_header_is_pinned_and_not_clickable() {
+        let mut s = summary_fixture();
+        s.selected = s.build_rows().len() - 1;
+        let frame = s.frame(9, 80);
+        assert_eq!(strip_ansi(frame.split("\r\n").next().unwrap()), "W1 ◆1 ✓1 ?3 ⊘1 $3 ◉3");
+        assert!(s.scroll_top > 0);
+        assert_eq!(s.row_at(0, 99), None);
+        assert_eq!(s.row_at(1, 99), Some(0)); // закреплённая секция Waiting
+        let head = s.fav_rows_n.get();
+        assert_eq!(s.row_at((1 + head + 1) as isize, 99), Some(head + s.scroll_top));
+        s.my_cols = 8;
+        s.fav_rows_n.set(2);
+        let header = s.summary_lines(8).len();
+        assert!(header > 1);
+        for row in 0..header {
+            assert_eq!(s.row_at(row as isize, 99), None);
+        }
+        assert_eq!(s.row_at(header as isize, 99), Some(0));
+        assert_eq!(s.row_at((header + 1) as isize, 99), Some(1));
+        assert_eq!(s.row_at((header + 2) as isize, 99), None); // separator
+        assert_eq!(s.row_at((header + 3) as isize, 99), Some(2 + s.scroll_top));
+        assert!(s.frame(0, 80).is_empty());
+        assert!(s.frame(10, 0).is_empty());
+        assert_eq!(s.frame(1, 8).split("\r\n").count(), 1);
     }
 
     #[test]
