@@ -54,6 +54,7 @@ pipe marks a pane read (used when restoring marks after a plugin reload).
   moves are *virtual* (display-order only — the plugin API can't move real tabs): a group
   follows Zellij's native tab positions until you explicitly reorder in it, after which the
   saved order wins for that group.
+- **Порядок панелей внутри вкладки**: на строке панели вкладки с несколькими панелями `Shift+↑`/`Shift+↓` (или `K`/`J`) в клавиатурном режиме переставляют панель среди панелей этой вкладки, выделение едет вместе с ней. Перестановка тоже виртуальная: меняется только порядок строк в колонке, раскладка Zellij остаётся прежней. Порядок хранится по сессии в `vtabs-pane-order-<session>` (ключи claude-zellij marker или id панели, переносятся при восстановлении сессии), новые панели встают в конец. Строка вкладки и Alt+i/Alt+o вне клавиатурного режима по-прежнему двигают вкладку.
 - **Persistent state** — group order, tab order, and collapse state survive session
   restarts and stay in sync across every tab's sidebar (stored per session in the plugin's
   cache dir).
@@ -353,7 +354,7 @@ bind "Alt o" { MessagePlugin "file:/home/you/.config/zellij/plugins/zellij-vtabs
 
 ### Bell mark
 
-A tab whose pane rang the bell while the tab was not shown gets Zellij's `[!]` after its label (and a folded group holding it, after its count) — the same mark as in Zellij's tab bar, from `TabInfo.has_bell_notification`; it goes when the tab is shown. Claude Code rings it when a turn ends.
+Непросмотренный bell Zellij показывается значком `!` в колонке состояния вкладки, панели или свёрнутой группы, только если состояние работы неизвестно. Известные Working / Waiting / Completed и остановленная панель имеют приоритет: старый bell не скрывает переходы состояния, пока вкладка не открыта. Сам bell Zellij снимает при показе вкладки; Claude Code подаёт его при завершении хода.
 
 ### Folding a tab
 

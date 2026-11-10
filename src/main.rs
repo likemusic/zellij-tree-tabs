@@ -94,6 +94,9 @@ printf '%s' "$t""#;
 /// Favorite panes, per session (local change): one key per line, `m:<marker>`
 /// for a claude-zellij pane (survives a restored session), else `p:<pane id>`.
 const FAVORITES_FILE_PREFIX: &str = "/cache/vtabs-fav-";
+/// Порядок панелей внутри вкладок в колонке: ключи панелей, как у избранного,
+/// по одному в строке. Только отображение — раскладку Zellij не меняет.
+const PANE_ORDER_FILE_PREFIX: &str = "/cache/vtabs-pane-order-";
 
 /// Last known working directory of each tab, by name (local change): a tab
 /// whose panes all stopped gives none (Zellij has no process to ask), and fell
@@ -743,6 +746,8 @@ struct State {
     /// favorite panes, in the order they were added (local change): listed on
     /// top of the tree and kept there when the list scrolls
     favorites: Vec<String>,
+    /// порядок панелей внутри вкладок (ключи как у избранного): Shift+↑/↓ на строке панели
+    pane_order: Vec<String>,
     /// claude-zellij marker of each pane (local change), from its command; kept
     /// once the pane exits — Zellij drops the command of an exited pane
     pane_marker: BTreeMap<u32, String>,
@@ -1201,6 +1206,7 @@ impl State {
             self.load_unread();
             self.load_titles();
             self.load_favorites();
+            self.load_pane_order();
             self.load_worktrees();
             self.check_server();
         }
@@ -1391,8 +1397,8 @@ impl State {
             // a repo's worktree list goes under the first tab in its main worktree
             let mut repos_shown: Vec<String> = Vec::new();
             for it in items.remove(&node.path).unwrap_or_default() {
-                let panes = self.tab_panes.get(&it.position);
-                let listed = panes.filter(|p| p.len() > 1 || self.show_single_pane && !p.is_empty());
+                let panes = self.tab_panes.get(&it.position).map(|_| self.ordered_panes(it.position));
+                let listed = panes.as_ref().filter(|p| p.len() > 1 || self.show_single_pane && !p.is_empty());
                 let main = self.tab_cwd.get(&it.position).and_then(|c| self.cwd_repo.get(c).filter(|m| *m == c));
                 let main = main.filter(|m| !repos_shown.contains(m) && !self.closed_worktrees(m).is_empty()).cloned();
                 let folded = self.folded(&tab_fold_key(&it.label), self.tab_exited(it.position));
@@ -1402,7 +1408,7 @@ impl State {
                     depth: node.depth,
                     active: it.active,
                     attention: it.attention,
-                    unread: self.any_unread(panes.into_iter().flatten().map(|(id, _, _)| id)),
+                    unread: self.any_unread(panes.iter().flatten().map(|(id, _, _)| id)),
                     fold: (listed.is_some() || main.is_some()).then_some(folded),
                 });
                 if let Some(m) = &main {
@@ -1530,7 +1536,8 @@ impl State {
             let Some(it) = tabs.clone().find(|t| t.position == pos) else { continue };
             let panes = self.tab_panes.get(&pos).map(Vec::as_slice).unwrap_or(&[]);
             let Some((_, title, focused)) = panes.iter().find(|p| p.0 == id) else { continue };
-            let others: Vec<_> = panes.iter().filter(|p| p.0 != id).collect();
+            let ordered = self.ordered_panes(pos);
+            let others: Vec<_> = ordered.iter().filter(|p| p.0 != id).collect();
             let waiting = others.iter().filter(|p| self.pane_attention.get(&p.0) == Some(&Attention::Waiting)).count();
             let unread = others.iter().filter(|p| self.pane_unread.contains(&p.0)).count();
             let name = strip_claude_glyph(title);
@@ -1654,6 +1661,68 @@ impl State {
             self.selected = idx;
         }
         true
+    }
+
+    /// Панели вкладки в порядке колонки: сначала по сохранённому порядку,
+    /// остальные (новые) — после них, в порядке раскладки.
+    fn ordered_panes(&self, position: usize) -> Vec<(u32, String, bool)> {
+        let mut panes = self.tab_panes.get(&position).cloned().unwrap_or_default();
+        let rank = |id: u32| {
+            let key = self.favorite_key(id);
+            self.pane_order.iter().position(|k| *k == key).unwrap_or(usize::MAX)
+        };
+        panes.sort_by_key(|p| rank(p.0));
+        panes
+    }
+
+    /// Поменять панель `id` местами с соседней в её вкладке (сохраняется);
+    /// выделение остаётся на той же панели в том же месте списка.
+    fn move_pane(&mut self, id: u32, delta: isize) -> bool {
+        let Some(pos) = self.pane_tab.get(&id).copied() else { return false };
+        let mut ids: Vec<u32> = self.ordered_panes(pos).into_iter().map(|p| p.0).collect();
+        let Some(i) = ids.iter().position(|p| *p == id) else { return false };
+        let j = i as isize + delta;
+        if j < 0 || j as usize >= ids.len() {
+            return false;
+        }
+        ids.swap(i, j as usize);
+        let keys: Vec<String> = ids.iter().map(|p| self.favorite_key(*p)).collect();
+        // ключи исчезнувших панелей не копим; панели этой вкладки — подряд, в новом порядке
+        let kept: Vec<String> = self
+            .pane_order
+            .iter()
+            .filter(|k| !keys.contains(k) && self.favorite_pane(k).is_some())
+            .cloned()
+            .collect();
+        self.pane_order = kept;
+        self.pane_order.extend(keys);
+        self.save_pane_order();
+        // та же панель может быть и в дереве, и под раскрытым избранным: ближайшая строка
+        let old = self.selected;
+        if let Some(idx) = self
+            .build_rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, Row::Pane { id: p, fav: false, .. } if *p == id))
+            .map(|(k, _)| k)
+            .min_by_key(|k| k.abs_diff(old))
+        {
+            self.selected = idx;
+        }
+        true
+    }
+
+    fn save_pane_order(&self) {
+        if let Some(s) = &self.session {
+            let _ = std::fs::write(format!("{}{}", PANE_ORDER_FILE_PREFIX, s), self.pane_order.join("\n"));
+        }
+    }
+
+    fn load_pane_order(&mut self) {
+        let Some(s) = &self.session else { return };
+        if let Ok(text) = std::fs::read_to_string(format!("{}{}", PANE_ORDER_FILE_PREFIX, s)) {
+            self.pane_order = text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+        }
     }
 
     fn load_favorites(&mut self) {
@@ -2345,6 +2414,15 @@ impl State {
                     })
                     .collect();
                 self.save_favorites();
+                self.pane_order = self
+                    .pane_order
+                    .iter()
+                    .filter_map(|k| match k.strip_prefix("p:").and_then(|id| id.parse::<u32>().ok()) {
+                        Some(old) => map.get(&old).map(|new| format!("p:{}", new)),
+                        None => Some(k.clone()),
+                    })
+                    .collect();
+                self.save_pane_order();
             }
         }
         let snap: Vec<String> = slots.iter().map(|(id, k)| format!("{}\t{}", id, k)).collect();
@@ -2463,7 +2541,14 @@ impl State {
                 _ => false,
             };
         }
-        // a pane row (where the bar lands after a click on its tab) moves its tab
+        // Строка панели в многопанельной вкладке двигает панель внутри вкладки.
+        if let Some(Row::Pane { id, fav: false, .. }) = rows.get(self.selected) {
+            let id = *id;
+            if self.pane_tab.get(&id).and_then(|t| self.tab_panes.get(t)).is_some_and(|ps| ps.len() > 1) {
+                return self.move_pane(id, delta);
+            }
+        }
+        // a lone pane row (a one-pane tab listed with show_single_pane) moves its tab
         if let Some(Row::Pane { id, fav: false, .. }) = rows.get(self.selected) {
             let tab = self.pane_tab.get(id).copied();
             let at = rows.iter().position(|r| matches!(r, Row::Tab { position, .. } if Some(*position) == tab));
@@ -4080,6 +4165,7 @@ impl State {
                     self.load_unread();
                     self.load_titles();
                     self.load_favorites();
+                    self.load_pane_order();
                     self.mark_focused_read();
                 }
                 self.ensure_timer();
@@ -4655,13 +4741,13 @@ impl State {
             }
             let core = if narrow {
                 match row {
-                    Row::Group { name, collapsed: true, .. } if self.group_has_bell(name) => BELL_GLYPH.to_string(),
+                    Row::Group { name, collapsed: true, attention: None, .. } if self.group_has_bell(name) => BELL_GLYPH.to_string(),
                     Row::Group { collapsed: true, attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
                     Row::Group { collapsed, .. } => (if *collapsed { "▶" } else { "▼" }).to_string(),
-                    Row::Tab { position, .. } if self.tab_has_bell(*position) => BELL_GLYPH.to_string(),
+                    Row::Tab { position, attention: None, .. } if self.tab_has_bell(*position) && !self.tab_exited(*position) => BELL_GLYPH.to_string(),
                     Row::Tab { attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
                     Row::Tab { active, .. } => (if *active { "●" } else { "·" }).to_string(),
-                    Row::Pane { id, .. } if self.pane_bell.contains(id) => format!(" {} ", BELL_GLYPH),
+                    Row::Pane { id, attention: None, .. } if self.pane_bell.contains(id) && !self.pane_exited.contains_key(id) => format!(" {} ", BELL_GLYPH),
                     Row::Pane { id, .. } if self.pane_exited.contains_key(id) => format!(" \u{1b}[2m{}\u{1b}[22m ", self.exited_icon),
                     Row::Pane { attention, unread, .. } => format!(" {}", self.icon_slot(*attention, *unread)),
                     Row::Worktree { .. } => "○".to_string(),
@@ -4687,7 +4773,7 @@ impl State {
                             format!("{}    \u{1b}[2m└\u{1b}[22m {} {}", indent, mark, label)
                         } else {
                             let icon = match collapsed {
-                                true if self.group_has_bell(name) => format!("{} ", BELL_GLYPH),
+                                true if attention.is_none() && self.group_has_bell(name) => format!("{} ", BELL_GLYPH),
                                 true => self.icon(*attention, *unread),
                                 false => String::new(),
                             };
@@ -4707,7 +4793,8 @@ impl State {
                         if let Some(buf) = editing {
                             format!("{}  {}{}", indent, fold_mark(*fold), with_cursor(buf, self.rename_back))
                         } else {
-                            let slot = if self.tab_has_bell(*position) {
+                            // Непрочитанный bell живёт до фокуса и не должен скрывать новые статусы.
+                            let slot = if attention.is_none() && self.tab_has_bell(*position) && !self.tab_exited(*position) {
                                 self.bell_slot(self.tab_background(*position))
                             } else if self.tab_exited(*position) {
                                 format!("\u{1b}[2m{}\u{1b}[22m{} ", self.exited_icon, self.background_slot(self.tab_background(*position)))
@@ -4731,7 +4818,7 @@ impl State {
                         let indent = "  ".repeat(*depth);
                         let branch = if *last { "└" } else { "├" };
                         let icon = match self.pane_exited.get(id) {
-                            _ if self.pane_bell.contains(id) => self.bell_slot(self.background_of([id])),
+                            None if attention.is_none() && self.pane_bell.contains(id) => self.bell_slot(self.background_of([id])),
                             // paused in the state column, where its ✓ was
                             Some(_) => format!("\u{1b}[2m{}\u{1b}[22m{} ", self.exited_icon, self.background_slot(self.background_of([id]))),
                             None => self.state_slot(*attention, *unread, self.background_of([id])),
@@ -5666,6 +5753,101 @@ mod tests {
         assert!(s.frame(0, 80).is_empty());
         assert!(s.frame(10, 0).is_empty());
         assert_eq!(s.frame(1, 8).split("\r\n").count(), 1);
+    }
+
+    #[test]
+    fn shift_arrows_on_a_pane_row_reorder_panes_within_the_tab() {
+        let tab = |position: usize, name: &str| TabInfo { position, name: name.into(), ..Default::default() };
+        let mut s = State {
+            separator: ':',
+            tabs: vec![tab(0, "g:a"), tab(1, "g:b")],
+            tab_panes: [
+                (0, vec![(1, "one".into(), false), (2, "two".into(), true), (3, "three".into(), false)]),
+                (1, vec![(4, "solo".into(), false)]),
+            ].into(),
+            pane_tab: [(1, 0), (2, 0), (3, 0), (4, 1)].into(),
+            pane_marker: [(3, "mk3".into())].into(),
+            ..Default::default()
+        };
+        let titles = |s: &State| -> Vec<String> {
+            s.build_rows().iter().filter_map(|r| match r {
+                Row::Pane { title, fav: false, .. } => Some(title.clone()),
+                Row::Tab { label, .. } => Some(format!("[{}]", label)),
+                _ => None,
+            }).collect()
+        };
+        assert_eq!(titles(&s), ["[a]", "one", "two", "three", "[b]"]);
+        let at = |s: &State, id: u32| s.build_rows().iter().position(|r| matches!(r, Row::Pane { id: p, .. } if *p == id)).unwrap();
+        s.selected = at(&s, 3);
+        assert!(s.move_selected(-1));
+        assert_eq!(titles(&s), ["[a]", "one", "three", "two", "[b]"]);
+        assert_eq!(s.selected, at(&s, 3)); // выделение едет вместе с панелью
+        assert!(s.move_selected(-1));
+        assert!(!s.move_selected(-1)); // край вкладки: не перескакивает в чужую
+        assert_eq!(titles(&s), ["[a]", "three", "one", "two", "[b]"]);
+        assert_eq!(s.pane_order, ["m:mk3", "p:1", "p:2"]);
+        // порядок раскладки и индексы для восстановления не тронуты
+        assert_eq!(s.tab_panes[&0].iter().map(|p| p.0).collect::<Vec<_>>(), [1, 2, 3]);
+        // новая панель встаёт в конец, известные сохраняют порядок
+        s.tab_panes.get_mut(&0).unwrap().insert(0, (5, "new".into(), false));
+        s.pane_tab.insert(5, 0);
+        assert_eq!(titles(&s), ["[a]", "three", "one", "two", "new", "[b]"]);
+        // строка вкладки по-прежнему двигает вкладку
+        s.selected = s.build_rows().iter().position(|r| matches!(r, Row::Tab { position: 0, .. })).unwrap();
+        assert!(s.move_selected(1));
+        assert_eq!(titles(&s), ["[b]", "[a]", "three", "one", "two", "new"]);
+    }
+
+    #[test]
+    fn unread_bell_does_not_mask_live_status_changes() {
+        // Скрытая вкладка уже звенела после Stop; новый turn не снимает bell.
+        for cols in [4, 80] {
+            for show_pane in [false, true] {
+                let mut s = State {
+                    separator: ':', waiting_icon: "Q".into(), completed_icon: "D".into(),
+                    exited_icon: "X".into(), spinner: vec!["W".into()],
+                    show_single_pane: show_pane,
+                    tabs: vec![TabInfo { position: 0, name: "target".into(),
+                        has_bell_notification: true, ..Default::default() }],
+                    tab_panes: [(0, vec![(7, "target".into(), false)])].into(),
+                    pane_tab: [(7, 0)].into(), pane_bell: [7].into(),
+                    my_rows: 30, my_cols: cols,
+                    ..Default::default()
+                };
+                for (signal, icon) in [("completed", "D"), ("working", "W"), ("waiting", "Q"), ("completed", "D")] {
+                    s.set_pane_attention(7, signal);
+                    let text = strip_ansi(&s.frame(30, cols));
+                    let body = text.split("\r\n").skip(s.summary_lines(cols).len()).collect::<Vec<_>>().join("\n");
+                    assert!(body.contains(icon), "cols={cols} pane={show_pane} signal={signal}: {body:?}");
+                    assert!(!body.contains('!'), "bell masks {signal}: {body:?}");
+                    assert!(s.pane_bell.contains(&7)); // фокус не менялся
+                }
+                s.pane_attention.clear();
+                assert!(strip_ansi(&s.frame(30, cols)).contains('!'));
+                s.pane_exited.insert(7, Some(0));
+                assert!(!strip_ansi(&s.frame(30, cols)).contains('!'));
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_group_status_takes_priority_over_bell() {
+        for cols in [4, 80] {
+            let mut s = State {
+                separator: ':', spinner: vec!["W".into()],
+                tabs: vec![TabInfo { position: 0, name: "group:target".into(),
+                    has_bell_notification: true, ..Default::default() }],
+                tab_panes: [(0, vec![(7, "target".into(), false)])].into(),
+                pane_attention: [(7, Attention::Working)].into(),
+                pane_bell: [7].into(), collapsed: ["group".into()].into(),
+                my_rows: 30, my_cols: cols,
+                ..Default::default()
+            };
+            let text = strip_ansi(&s.frame(30, cols));
+            let body = text.split("\r\n").skip(s.summary_lines(cols).len()).collect::<Vec<_>>().join("\n");
+            assert!(body.contains('W'), "{body:?}");
+            assert!(!body.contains('!'), "{body:?}");
+        }
     }
 
     #[test]
