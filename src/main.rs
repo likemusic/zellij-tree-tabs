@@ -667,6 +667,9 @@ fn is_section(name: &str) -> bool {
 /// Below this width — or when collapsed — the sidebar draws only state icons
 /// (local change).
 const NARROW_COLS: usize = 8;
+/// Уже этой ширины (в том числе после `0`, когда Zellij не сужает панель до пары
+/// колонок) дерево рисуется компактно: значок и название, без отступов и веток.
+const COMPACT_COLS: usize = 16;
 
 #[derive(Default)]
 struct State {
@@ -829,6 +832,8 @@ struct State {
     /// last resize issued: (columns before, increase, ticks waited); observed step size;
     /// columns and direction in which a resize had no effect (not retried)
     last_resize: Option<(usize, bool, u8)>,
+    /// шагов в последней отправленной пачке (по одиночному учим размер шага)
+    resize_sent: usize,
     resize_step: usize,
     /// own width as of the last tick (see sync_width)
     cols_settled: usize,
@@ -3332,7 +3337,7 @@ impl State {
         self.width_saved = None;
         self.width_stuck = None;
         self.resize_misses = 0;
-        self.last_resize = None;
+        // пачка ресайзов в полёте не сбрасывается: иначе следующая ляжет поверх неё
         self.save_state();
         self.sync_width(false);
         true
@@ -3348,7 +3353,7 @@ impl State {
         }
         self.width_stuck = None;
         self.resize_misses = 0;
-        self.last_resize = None;
+        // пачка ресайзов в полёте не сбрасывается: иначе следующая ляжет поверх неё
         self.save_state();
         self.sync_width(false);
         true
@@ -3360,33 +3365,59 @@ impl State {
     /// a resize lands, and resending on each queued up several that then all
     /// landed at once.
     fn sync_width(&mut self, tick: bool) {
-        let (Some(target), c) = (self.width, self.my_cols) else { return };
+        let Some((neighbor, increase, n)) = self.resize_due(tick) else { return };
+        // the neighbour gives up (or takes) columns on its left edge.
+        // Все шаги сразу: по одному с ожиданием тика сворачивание шло секундами.
+        // Остаток после посадки доберёт следующий вызов.
+        let resize = if increase { Resize::Decrease } else { Resize::Increase };
+        for _ in 0..n {
+            resize_pane_with_id(
+                ResizeStrategy { resize, direction: Some(Direction::Left), invert_on_boundaries: false },
+                PaneId::Terminal(neighbor),
+            );
+        }
+        // Zellij 0.45 (и main): ScreenInstruction::ResizePaneWithId меняет раскладку,
+        // но не рисует и не рассылает PaneUpdate (ресайз мышью — делает). Ресайз
+        // садился «через минуту» — при чужом событии, — а мы считали его потерянным
+        // и повторяли. Пустая группировка панелей — без последствий, но её
+        // обработчик рассылает состояние сессии, так что PaneUpdate приходит сразу.
+        group_and_ungroup_panes(Vec::new(), Vec::new(), false);
+    }
+
+    /// Решение sync_width без вызовов Zellij: какую пачку ресайзов отправить
+    /// соседу (id соседа, расширять ли колонку, число шагов), если отправлять.
+    fn resize_due(&mut self, tick: bool) -> Option<(u32, bool, usize)> {
+        let (Some(target), c) = (self.width, self.my_cols) else { return None };
         // a hidden tab's resize is dropped by Zellij and its misses would mark
         // the width stuck for good: each sidebar catches up when it is shown
         if c == 0 || self.hidden {
-            return;
+            return None;
         }
         if let Some((before, increase, waited)) = self.last_resize {
             if c != before {
+                // вся пачка приходит одним PaneUpdate (см. sync_width)
                 self.last_resize = None;
                 self.resize_misses = 0;
                 // a step that took longer than one tick may have landed together
                 // with a retry: its size is not one step
-                if waited == 0 {
+                if waited == 0 && self.resize_sent == 1 {
                     self.resize_step = c.abs_diff(before);
                 }
             } else if !tick {
-                return; // still in flight
+                return None; // still in flight
             } else if waited < RESIZE_WAIT_TICKS {
-                // a busy server applies a resize seconds late: resending now
-                // queues a second one and both land together, overshooting
                 self.last_resize = Some((before, increase, waited + 1));
-                return;
+                return None;
             } else {
                 // no effect for several ticks: lost in a relayout, a fixed-size
-                // pane, or the minimum width — retry a few times, then give up
-                // at this width until it or the target changes
+                // pane, or the minimum width
                 self.last_resize = None;
+                // сворачивание упёрлось в минимальную ширину Zellij: цель достигнута
+                if target <= 1 && !increase {
+                    self.width = None;
+                    return None;
+                }
+                // retry a few times, then give up at this width until it or the target changes
                 self.resize_misses += 1;
                 if self.resize_misses >= 3 {
                     self.width_stuck = Some((c, increase));
@@ -3403,10 +3434,10 @@ impl State {
         // moment, and a resize sent then lands on the settled width
         if tick && c != self.cols_settled {
             self.cols_settled = c;
-            return;
+            return None;
         }
         if c != self.cols_settled {
-            return;
+            return None;
         }
         let step = self.step_cols();
         let increase = if c < target && (c + step).abs_diff(target) < target - c {
@@ -3417,24 +3448,21 @@ impl State {
             // as close as the resize steps get: done, the border is the user's
             // again (a mouse drag stays)
             self.width = None;
-            return;
+            return None;
         };
         if self.width_stuck == Some((c, increase)) {
             self.width = None;
-            return;
+            return None;
         }
         let Some(neighbor) = self.neighbor else {
             self.width = None;
-            return;
+            return None;
         };
         vlog!("width resize my_id={} cols={} target={} step={} increase={} neighbor={}", self.my_id, c, target, step, increase, neighbor);
-        // the neighbour gives up (or takes) columns on its left edge
-        let resize = if increase { Resize::Decrease } else { Resize::Increase };
-        resize_pane_with_id(
-            ResizeStrategy { resize, direction: Some(Direction::Left), invert_on_boundaries: false },
-            PaneId::Terminal(neighbor),
-        );
+        let n = resize_steps(c, target, step);
+        self.resize_sent = n;
         self.last_resize = Some((c, increase, 0));
+        Some((neighbor, increase, n))
     }
 
     /// Switch project/status view, keeping the selection on the same tab or pane.
@@ -3535,7 +3563,8 @@ impl State {
     /// помещаются вместе с деревом, прокручиваем весь список, не выталкивая шапку.
     fn list_layout(&self, rows: usize, cols: usize, len: usize) -> (usize, usize, usize) {
         let header = self.summary_lines(cols).len().max(TOP_PAD);
-        let narrow = self.width_saved.is_some() && self.role != Role::Brain || cols < NARROW_COLS;
+        // компактный вид — по фактической ширине, а не по режиму «свёрнуто»
+        let narrow = cols < COMPACT_COLS;
         let footer = match (&self.moving, self.key_hints()) {
             (Some(_), _) => self.sessions.len().min(9) + 3,
             (None, Some(h)) if !narrow => h.len() + 1,
@@ -3607,7 +3636,9 @@ impl State {
                     // a click on the ▶/▼ folds (local change); on the name it only
                     // selects, and takes the keys so ←/→ and Enter act on it
                     self.selected = idx;
-                    if col == LEFT_PAD + 2 * depth {
+                    // в компактном виде ▶/▼ стоит в первой колонке, без отступа
+                    let compact = self.my_cols < COMPACT_COLS;
+                    if col == LEFT_PAD + 2 * depth && !compact || compact && col <= 1 {
                         self.activate(idx);
                     } else if !self.keys_on {
                         self.keys_on_here(self.my_tab);
@@ -3616,7 +3647,8 @@ impl State {
                     // the ▼/▶ before the label folds the tab's panes and worktrees
                     let _ = (position, attention, unread);
                     let mark = LEFT_PAD + 2 * depth + 2;
-                    if col == mark || col == mark + 1 && self.width_saved.is_none() {
+                    // в компактном виде маркера свёртки нет: клик по строке переключает вкладку
+                    if self.my_cols >= COMPACT_COLS && (col == mark || col == mark + 1 && self.width_saved.is_none()) {
                         let key = tab_fold_key(label);
                         self.set_folded(&key, !folded);
                     } else {
@@ -3624,7 +3656,7 @@ impl State {
                     }
                 } else if let Row::Pane { fav: true, fav_fold: Some(folded), id, .. } = &rows[idx] {
                     // the ▸/▾ before the ★ folds the favorite's other panes
-                    if col == LEFT_PAD + 2 || col == LEFT_PAD + 3 {
+                    if self.my_cols >= COMPACT_COLS && (col == LEFT_PAD + 2 || col == LEFT_PAD + 3) {
                         self.fold_favorite(*id, !folded);
                     } else {
                         self.click_row(&rows, idx);
@@ -4715,9 +4747,9 @@ impl State {
             out.push_str(&format!("{}\u{1b}[2m(no tabs)\u{1b}[0m", pad));
             return out;
         }
-        // collapsed sidebar (local change): only the state icons, one per row
-        // the brain's width_saved is the active tab's, not this pane's
-        let narrow = self.width_saved.is_some() && self.role != Role::Brain || cols < NARROW_COLS;
+        // Компактно — по фактической ширине: Zellij не сужает панель до пары колонок,
+        // и в свёрнутой колонке после значка остаются названия.
+        let narrow = cols < COMPACT_COLS;
         // a list taller than the pane would scroll the pane's terminal and shift
         // every click by the overflow: draw only the window around the selection
         // Сводка закреплена всегда; секции избранного — только пока хватает места.
@@ -4740,7 +4772,7 @@ impl State {
                 out.push_str(&format!("\u{1b}[2m{}\u{1b}[0m\r\n", truncate_visible(&rule, cols)));
             }
             let core = if narrow {
-                match row {
+                let icon = match row {
                     Row::Group { name, collapsed: true, attention: None, .. } if self.group_has_bell(name) => BELL_GLYPH.to_string(),
                     Row::Group { collapsed: true, attention: Some(a), unread, .. } => self.icon(Some(*a), *unread),
                     Row::Group { collapsed, .. } => (if *collapsed { "▶" } else { "▼" }).to_string(),
@@ -4751,7 +4783,19 @@ impl State {
                     Row::Pane { id, .. } if self.pane_exited.contains_key(id) => format!(" \u{1b}[2m{}\u{1b}[22m ", self.exited_icon),
                     Row::Pane { attention, unread, .. } => format!(" {}", self.icon_slot(*attention, *unread)),
                     Row::Worktree { .. } => "○".to_string(),
-                }
+                };
+                let name = match row {
+                    Row::Group { label, .. } => label.clone(),
+                    Row::Tab { label, .. } => label.clone(),
+                    Row::Pane { title, .. } => strip_claude_glyph(title).to_string(),
+                    Row::Worktree { label, .. } => label.clone(),
+                };
+                let name = if matches!(row, Row::Pane { id, .. } if self.pane_exited.contains_key(id)) {
+                    format!("\u{1b}[2m{}\u{1b}[22m", name)
+                } else {
+                    name
+                };
+                format!("{} {}", icon.trim_end(), name)
             } else {
                 match row {
                     Row::Worktree { label, depth, .. } => {
@@ -4949,7 +4993,9 @@ impl ZellijPlugin for State {
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        let out = if self.role == Role::Screen { self.frame_text.clone() } else { self.frame(rows, cols) };
+        // Кадр brain строится по размеру из PaneUpdate и при ресайзе приходит с опозданием:
+        // старый, более широкий кадр иначе переносится терминалом и ломает колонку.
+        let out = if self.role == Role::Screen { clip_frame(&self.frame_text, rows, cols) } else { self.frame(rows, cols) };
         print!("{}", out);
     }
 }
@@ -5120,6 +5166,29 @@ fn visible_width(s: &str) -> usize {
 
 /// Truncate to `max` *visible* columns, preserving ANSI escapes intact (never cut
 /// mid-sequence) and appending `…` when content is dropped.
+/// Сколько шагов ресайза отправить сразу, чтобы дойти от `cols` до `target`:
+/// к минимуму (`target` <= 1) — с запасом, ведь меньше минимума Zellij не сузит;
+/// иначе — ближайшее число шагов, чтобы не проскочить.
+fn resize_steps(cols: usize, target: usize, step: usize) -> usize {
+    let step = step.max(1);
+    if target <= 1 {
+        return cols / step + 1;
+    }
+    ((cols.abs_diff(target) + step / 2) / step).max(1)
+}
+
+/// Кадр, обрезанный по размеру панели: не шире `cols` и не выше `rows` строк.
+fn clip_frame(text: &str, rows: usize, cols: usize) -> String {
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+    text.split("\r\n")
+        .take(rows)
+        .map(|l| if visible_width(l) > cols { format!("{}\u{1b}[0m", truncate_visible(l, cols)) } else { l.to_string() })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
 fn truncate_visible(s: &str, max: usize) -> String {
     if visible_width(s) <= max {
         return s.to_string();
@@ -5796,6 +5865,60 @@ mod tests {
         s.selected = s.build_rows().iter().position(|r| matches!(r, Row::Tab { position: 0, .. })).unwrap();
         assert!(s.move_selected(1));
         assert_eq!(titles(&s), ["[b]", "[a]", "three", "one", "two", "new"]);
+    }
+
+    #[test]
+    fn screen_clips_a_stale_wider_frame_to_its_pane() {
+        let frame = "\u{1b}[1mabcdefghij\u{1b}[0m\r\nshort\r\nthird line here";
+        let out = clip_frame(frame, 2, 4);
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| visible_width(l) <= 4), "{lines:?}");
+        assert_eq!(strip_ansi(lines[1]), "sho…");
+        assert_eq!(clip_frame("ab\r\ncd", 5, 5), "ab\r\ncd");
+        assert!(clip_frame(frame, 0, 4).is_empty());
+    }
+
+    #[test]
+    fn collapsed_but_still_wide_sidebar_keeps_names() {
+        let mut s = summary_fixture();
+        s.role = Role::Brain;
+        s.width_saved = Some(32);
+        // Zellij не сузил панель до значков: компактно, значок и название без отступов
+        let f = strip_ansi(&s.frame(30, 11));
+        assert!(f.contains("mixed"), "{f:?}");
+        assert!(f.split("\r\n").all(|l| visible_width(l) <= 11));
+        assert!(!f.contains('├'), "{f:?}");
+        // совсем узкая — сколько влезет, но не шире панели
+        assert!(strip_ansi(&s.frame(30, 4)).split("\r\n").all(|l| visible_width(l) <= 4));
+    }
+
+    #[test]
+    fn a_reported_batch_ends_the_flight_and_collapse_stops_at_the_minimum() {
+        let mut s = State { width: Some(1), my_cols: 47, cols_settled: 47, resize_step: 10, neighbor: Some(0), ..Default::default() };
+        assert_eq!(s.resize_due(false), Some((0, false, 5)));
+        assert_eq!(s.resize_due(false), None); // в полёте
+        // вся пачка пришла одним PaneUpdate, упёршись в минимум 22
+        s.my_cols = 22;
+        assert_eq!(s.resize_due(false), None);
+        assert_eq!(s.last_resize, None);
+        assert_eq!(s.resize_step, 10); // по пачке размер шага не учим
+        s.cols_settled = 22;
+        assert_eq!(s.resize_due(false), Some((0, false, 3)));
+        // минимум: эффекта нет — цель достигнута, без повторов
+        for _ in 0..RESIZE_WAIT_TICKS {
+            assert_eq!(s.resize_due(true), None);
+        }
+        assert_eq!(s.resize_due(true), None);
+        assert_eq!(s.width, None);
+    }
+
+    #[test]
+    fn collapse_sends_all_steps_at_once() {
+        assert_eq!(resize_steps(32, 1, 10), 4); // до минимума: с запасом, лишние шаги Zellij отбросит
+        assert_eq!(resize_steps(11, 32, 10), 2);
+        assert_eq!(resize_steps(30, 35, 10), 1);
+        assert_eq!(resize_steps(30, 31, 0), 1);
     }
 
     #[test]
