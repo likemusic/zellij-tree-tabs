@@ -39,7 +39,12 @@ fi
 count() {
   shells=0; monitors=0
   for p in $(pgrep -P "$claude"); do
-    grep -q shell-snapshots "/proc/$p/cmdline" 2>/dev/null || continue
+    # A command of the Bash tool runs through the shell snapshot, but bash execs
+    # a lone last command (`bash script.sh`), and the snapshot leaves cmdline;
+    # its environment still carries CLAUDE_CODE_EXECPATH, which MCP servers lack.
+    grep -q shell-snapshots "/proc/$p/cmdline" 2>/dev/null \
+      || tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q '^CLAUDE_CODE_EXECPATH=' \
+      || continue
     case "$(readlink "/proc/$p/fd/1" 2>/dev/null)" in
       */tasks/*.output) shells=$((shells + 1)) ;;
       socket:*|pipe:*)  monitors=$((monitors + 1)) ;;
